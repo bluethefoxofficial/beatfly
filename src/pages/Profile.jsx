@@ -2,17 +2,20 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Play, Share2, MoreHorizontal, Music, Disc, AlertTriangle } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { Play, Share2, MoreHorizontal, Music, Disc, AlertTriangle, UserX } from 'lucide-react';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
 
 const Profile = () => {
   const { userId } = useParams();
-  const { playTrack, currentTrack, isPlaying } = useAudio();
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack } = useAudio();
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showOptions, setShowOptions] = useState(false);
+  const [isBlocked, setIsBlocked] = useState(false);
   const optionsRef = useRef(null);
 
   useEffect(() => {
@@ -33,6 +36,10 @@ const Profile = () => {
       setLoading(true);
       const response = await MusicAPI.getArtistProfile(userId);
       setProfile(response.data);
+
+      const blockedArtistsResponse = await MusicAPI.getBlockedArtists().catch(() => ({ data: { artists: [] } }));
+      const blockedArtistIds = blockedArtistsResponse.data.artists.map(a => a.id);
+      setIsBlocked(blockedArtistIds.includes(Number(userId)));
     } catch (err) {
       setError('Failed to load profile.');
       console.error(err);
@@ -57,6 +64,20 @@ const Profile = () => {
       setShowOptions(false);
     } catch (err) {
       console.error('Error sharing profile:', err);
+    }
+  };
+
+  const toggleBlock = async () => {
+    try {
+      if (isBlocked) {
+        await MusicAPI.unblockArtist(userId);
+      } else {
+        await MusicAPI.blockArtist(userId);
+      }
+      setIsBlocked(!isBlocked);
+      setShowOptions(false);
+    } catch (err) {
+      console.error('Error toggling block:', err);
     }
   };
 
@@ -150,12 +171,20 @@ const Profile = () => {
                   </li>
                   <li>
                     <Link
-                      to="/report"
+                      to={`/report/${userId}`}
                       onClick={() => setShowOptions(false)}
                       className="block px-4 py-2 text-sm flex items-center gap-2 hover:bg-surface-light transition-colors"
                     >
                       <AlertTriangle size={16} /> Report Artist
                     </Link>
+                  </li>
+                  <li>
+                    <button
+                      onClick={toggleBlock}
+                      className="w-full text-left px-4 py-2 text-sm flex items-center gap-2 hover:bg-surface-light transition-colors"
+                    >
+                      <UserX size={16} /> {isBlocked ? 'Unblock Artist' : 'Block Artist'}
+                    </button>
                   </li>
                 </ul>
               </motion.div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -11,10 +11,23 @@ import {
   PlayCircle,
   Disc,
   Music,
-  Sparkles
+  Sparkles,
+  ThumbsDown,
 } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, useCurrentTrack, useIsPlaying, useQueue } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
+
+const buildImageUrl = (path, height = 320) => {
+  if (!path) return '/default-album-art.png';
+  const clean = path.split('?')[0];
+
+  if (clean.startsWith('http')) {
+    return clean.includes('?') ? `${clean}&h=${height}` : `${clean}?h=${height}`;
+  }
+
+  const filename = clean.split('/').pop();
+  return `${MusicAPI.getImage('albumArt', filename)}?h=${height}`;
+};
 
 // Toast notification component
 const Toast = ({ message, isVisible }) => (
@@ -37,45 +50,90 @@ const Toast = ({ message, isVisible }) => (
 
 const Track = () => {
   const { trackId } = useParams();
-  const {
-    playTrack,
-    currentTrack,
-    isPlaying,
-    togglePlay,
-    addToQueue
-  } = useAudio();
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay, addToQueue } = useAudio();
+  const queue = useQueue();
 
   const [track, setTrack] = useState(null);
   const [album, setAlbum] = useState(null);
+  const [artistProfile, setArtistProfile] = useState(null); // New state for artist profile
   const [isLiked, setIsLiked] = useState(false);
+  const [isDisliked, setIsDisliked] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [hoveredTrack, setHoveredTrack] = useState(null);
   const [toast, setToast] = useState({ visible: false, message: '' });
 
   useEffect(() => {
+    let cancelled = false;
+
     const fetchData = async () => {
       try {
         setLoading(true);
-        const trackResponse = await MusicAPI.getTrack(trackId);
+        setError(null);
+
+        const [trackResponse, favoritesResponse, dislikedResponse] = await Promise.all([
+          MusicAPI.getTrack(trackId),
+          MusicAPI.getFavoriteTracks().catch(() => ({ data: { tracks: [] } })),
+          MusicAPI.getDislikedTracks().catch(() => ({ data: { tracks: [] } })),
+        ]);
+
+        if (cancelled) return;
+
         setTrack(trackResponse.data);
 
+        let fetchedAlbum = null;
         if (trackResponse.data.album_id) {
-          const albumResponse = await MusicAPI.getAlbum(trackResponse.data.album_id);
-          setAlbum(albumResponse.data);
+          try {
+            const albumResponse = await MusicAPI.getAlbum(trackResponse.data.album_id);
+            if (!cancelled) {
+              fetchedAlbum = albumResponse.data;
+              setAlbum(fetchedAlbum);
+            }
+          } catch (err) {
+            if (!cancelled) {
+              console.error('Error fetching album:', err);
+            }
+          }
         }
 
-        const favoritesResponse = await MusicAPI.getFavoriteTracks();
-        setIsLiked(favoritesResponse.data.tracks?.some(t => t.id === parseInt(trackId)));
+        // Fetch artist profile if album (and thus user_id) is available
+        if (fetchedAlbum?.user_id) {
+          try {
+            const artistResponse = await MusicAPI.getArtistProfile(fetchedAlbum.user_id);
+            if (!cancelled) {
+              setArtistProfile(artistResponse.data);
+            }
+          } catch (err) {
+            if (!cancelled) {
+              console.error('Error fetching artist profile:', err);
+            }
+          }
+        }
+
+        const favorites = favoritesResponse?.data?.tracks || [];
+        setIsLiked(favorites.some(t => t.id === Number(trackId)));
+
+        const disliked = dislikedResponse?.data?.tracks || [];
+        setIsDisliked(disliked.some(t => t.id === Number(trackId)));
       } catch (err) {
-        console.error('Error fetching track data:', err);
-        setError('Failed to load track details');
+        if (!cancelled) {
+          console.error('Error fetching track data:', err);
+          setError('Failed to load track details');
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
 
     fetchData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [trackId]);
 
   const showToast = (message) => {
@@ -97,9 +155,28 @@ const Track = () => {
     }
   };
 
+  const toggleDislike = async () => {
+    try {
+      if (isDisliked) {
+        await MusicAPI.removeDislike(trackId);
+      } else {
+        await MusicAPI.dislikeTrack(trackId);
+      }
+      setIsDisliked(!isDisliked);
+      showToast(isDisliked ? 'Removed from dislikes' : 'Added to dislikes');
+    } catch (err) {
+      console.error('Error toggling dislike:', err);
+    }
+  };
+
   const handleAddToQueue = () => {
     if (track) {
-      addToQueue(track);
+      const enrichedTrack = {
+        ...track,
+        album_art: track.album_art || album?.album_art,
+        track_image: track.track_image || album?.album_art,
+      };
+      addToQueue(enrichedTrack);
       showToast(`Added "${track.title}" to queue`);
     }
   };
@@ -123,6 +200,23 @@ const Track = () => {
     const remainingSeconds = Math.floor(seconds % 60);
     return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
   };
+
+  const coverImage = useMemo(
+    () => buildImageUrl(track?.track_image || album?.album_art, 320),
+    [album?.album_art, track?.track_image]
+  );
+  const heroImage = useMemo(
+    () => buildImageUrl(track?.track_image || album?.album_art, 420),
+    [album?.album_art, track?.track_image]
+  );
+  const withArt = useMemo(
+    () => track ? {
+      ...track,
+      album_art: track.album_art || album?.album_art,
+      track_image: track.track_image || album?.album_art,
+    } : null,
+    [album?.album_art, track]
+  );
 
   if (loading) {
     return (
@@ -179,7 +273,7 @@ const Track = () => {
     transition={{ duration: 20, repeat: Infinity, direction: "alternate" }}
     >
     <img
-    src={track.track_image + "?h=100"}
+    src={heroImage}
     alt=""
     className="w-full h-full object-cover"
     />
@@ -203,7 +297,7 @@ const Track = () => {
     transition={{ type: "spring", stiffness: 200 }}
     >
     <img
-    src={track.track_image + "?h=320"}
+    src={coverImage}
     alt={track.title}
     className="w-48 h-48 md:w-72 md:h-72 object-cover rounded-xl shadow-2xl"
     onError={(e) => {
@@ -212,7 +306,7 @@ const Track = () => {
     }}
     />
     <motion.button
-    onClick={() => isCurrentTrack ? togglePlay() : playTrack(track)}
+    onClick={() => isCurrentTrack ? togglePlay() : playTrack(withArt || track)}
     className="absolute inset-0 flex items-center justify-center bg-black/60
     opacity-0 group-hover:opacity-100 transition-opacity rounded-xl"
     whileHover={{ backgroundColor: "rgba(0,0,0,0.8)" }}
@@ -256,9 +350,9 @@ const Track = () => {
     whileHover={{ scale: 1.05 }}
     className="flex items-center gap-2"
     >
-    {track.artistId ? (
+    {artistProfile?.user_id ? (
       <Link
-      to={`/profile/${track.artistId}`}
+      to={`/profile/${artistProfile.user_id}`}
       className="text-white/60 hover:text-white transition-colors font-medium"
       >
       {track.artist}
@@ -305,7 +399,7 @@ const Track = () => {
     <motion.button
     whileHover={{ scale: 1.05 }}
     whileTap={{ scale: 0.95 }}
-    onClick={() => isCurrentTrack ? togglePlay() : playTrack(track)}
+    onClick={() => isCurrentTrack ? togglePlay() : playTrack(withArt || track)}
     className="w-16 h-16 bg-accent rounded-full flex items-center justify-center
     shadow-2xl hover:shadow-accent/50 transition-all duration-300"
     >
@@ -327,6 +421,21 @@ const Track = () => {
     <Heart
     size={28}
     fill={isLiked ? 'currentColor' : 'none'}
+    className="transition-all duration-300"
+    />
+    </motion.button>
+
+    <motion.button
+    whileHover={{ scale: 1.1 }}
+    whileTap={{ scale: 0.9 }}
+    onClick={toggleDislike}
+    className={`p-3 rounded-full transition-all duration-300 ${
+      isDisliked ? 'text-red-500 bg-red-500/20' : 'text-gray-400 hover:text-white hover:bg-white/10'
+    }`}
+    >
+    <ThumbsDown
+    size={28}
+    fill={isDisliked ? 'currentColor' : 'none'}
     className="transition-all duration-300"
     />
     </motion.button>
@@ -382,7 +491,11 @@ const Track = () => {
           className={`flex items-center gap-4 p-4 rounded-lg hover:bg-white/5
             group cursor-pointer transition-all duration-200
             ${isCurrentAlbumTrack ? 'bg-accent/10 text-accent' : ''}`}
-            onClick={() => playTrack(albumTrack)}
+            onClick={() => playTrack({
+              ...albumTrack,
+              album_art: albumTrack.album_art || album?.album_art,
+              track_image: albumTrack.track_image || album?.album_art,
+            })}
             >
             <div className="w-12 text-center">
             <AnimatePresence mode="wait">
@@ -438,3 +551,4 @@ const Track = () => {
 };
 
 export default Track;
+export const MemoizedTrack = React.memo(Track);

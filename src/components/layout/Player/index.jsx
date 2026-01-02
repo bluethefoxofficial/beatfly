@@ -1,7 +1,20 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, memo } from 'react';
 import { useLocation } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
-import { useAudio } from '../../../contexts/AudioContext';
+// Use Zustand selectors for state (prevents unnecessary re-renders)
+import {
+  useAudio,
+  useCurrentTrack,
+  useIsPlaying,
+  useDuration,
+  useCurrentTime,
+  useVolume,
+  useRepeat,
+  useShuffle,
+  useLoading,
+  usePlaybackError,
+  useQueue as useQueueState,
+} from '../../../contexts/AudioContext';
 
 // Services
 import MusicAPI from '../../../services/api';
@@ -28,24 +41,16 @@ import AudioVisualizer from './AudioVisualizer';
  *   - Queue management (desktop vs. mobile)
  *   - EQ popup
  *   - Lyrics panel, etc.
+ *
+ * Uses Zustand selectors for optimal performance - only re-renders when
+ * the specific state it subscribes to changes.
  */
-const Player = ({ children }) => {
+const Player = () => {
   const { isMobile } = useResponsive();
   const location = useLocation();
 
-  // Pull everything from our audio context
+  // Get methods from context (stable references)
   const {
-    currentTrack,
-    isPlaying,
-    duration,
-    currentTime,
-    volume,
-    repeat,
-    shuffle,
-    queue,
-    loading,
-    error,
-
     togglePlay,
     seek,
     setVolume,
@@ -55,11 +60,25 @@ const Player = ({ children }) => {
     toggleRepeat,
     removeFromQueue,
     clearQueue,
-
-    // Audio processing
-    audioContext,
-    analyzerNode
+    getAudioContext,
+    getAnalyzerNode,
   } = useAudio();
+
+  // Get state from Zustand selectors (only re-renders when specific value changes)
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const duration = useDuration();
+  const currentTime = useCurrentTime();
+  const volume = useVolume();
+  const repeat = useRepeat();
+  const shuffle = useShuffle();
+  const loading = useLoading();
+  const error = usePlaybackError();
+  const queue = useQueueState();
+
+  // Get audio nodes via getters (refs, not state)
+  const audioContext = getAudioContext();
+  const analyzerNode = getAnalyzerNode();
 
   // Local UI states
   const [isMuted, setIsMuted] = useState(false);
@@ -71,7 +90,11 @@ const Player = ({ children }) => {
   const [showPlaylistModal, setShowPlaylistModal] = useState(false);
 
   // Keep track of previous volume (for toggling mute)
-  const [prevVolume, setPrevVolume] = useState(volume);
+  const [prevVolume, setPrevVolume] = useState(() => {
+    // Ensure we start with a valid volume value
+    const initialVolume = typeof volume === 'number' && !isNaN(volume) ? volume : 1;
+    return initialVolume;
+  });
 
   // Track route changes (close open panels)
   const [prevPath, setPrevPath] = useState(location.pathname);
@@ -81,8 +104,13 @@ const Player = ({ children }) => {
     return localStorage.getItem('player-tutorial-shown') === 'true';
   });
 
+  // Safely sanitize volume value
+  const safeVolume = useMemo(() => {
+    return typeof volume === 'number' && !isNaN(volume) ? volume : 0;
+  }, [volume]);
+
   /**
-   * Close any open panels (Expanded/Queue/Lyrics/EQ) 
+   * Close any open panels (Expanded/Queue/Lyrics/EQ)
    * when navigating to a different route
    */
   useEffect(() => {
@@ -97,7 +125,7 @@ const Player = ({ children }) => {
   }, [location.pathname, prevPath]);
 
   /**
-   * Mobile-specific gesture handling
+   * Mobile-specific gesture handling - optimized for performance
    */
   useEffect(() => {
     if (!isMobile) return;
@@ -110,9 +138,10 @@ const Player = ({ children }) => {
 
     // Prevent default scrolling if user is interacting with player
     const preventDefaultScroll = (e) => {
+      const target = e.target;
       if (
-        e.target.closest('.player-controls') ||
-        e.target.closest('.art-container') ||
+        target.closest('.player-controls') ||
+        target.closest('.art-container') ||
         showExpanded ||
         showQueue ||
         showLyrics ||
@@ -129,22 +158,6 @@ const Player = ({ children }) => {
       document.removeEventListener('touchmove', preventDefaultScroll);
     };
   }, [isMobile, showExpanded, showQueue, showLyrics, showEQ, tutorialShown]);
-
-  /**
-   * Close panels when tapping the background in mobile mode
-   */
-  const handleBackgroundTap = useCallback(
-    (e) => {
-      if (!isMobile) return;
-      if (e.target === e.currentTarget) {
-        if (showLyrics) setShowLyrics(false);
-        else if (showQueue) setShowQueue(false);
-        else if (showEQ) setShowEQ(false);
-        else if (showExpanded) setShowExpanded(false);
-      }
-    },
-    [isMobile, showLyrics, showQueue, showEQ, showExpanded]
-  );
 
   /**
    * Format time into mm:ss
@@ -205,33 +218,46 @@ const Player = ({ children }) => {
   }, [currentTrack, isLiked]);
 
   /**
-   * Handler for volume slider
+   * Handler for volume slider - fixed to handle NaN
    */
   const handleVolumeChange = useCallback(
     (e) => {
       const newVolume = parseFloat(e.target.value);
-      setVolume(newVolume);
-      setIsMuted(newVolume === 0);
-      if (newVolume > 0) {
-        setPrevVolume(newVolume);
+
+      // Ensure we have a valid volume value
+      if (isNaN(newVolume)) return;
+
+      // Clamp volume between 0 and 1
+      const clampedVolume = Math.max(0, Math.min(1, newVolume));
+
+      setVolume(clampedVolume);
+      setIsMuted(clampedVolume === 0);
+
+      if (clampedVolume > 0) {
+        setPrevVolume(clampedVolume);
       }
     },
     [setVolume]
   );
 
   /**
-   * Toggle mute/unmute
+   * Toggle mute/unmute - improved to handle edge cases
    */
   const toggleMute = useCallback(() => {
-    if (isMuted) {
-      setVolume(prevVolume > 0 ? prevVolume : 0.5);
+    if (isMuted || safeVolume === 0) {
+      // Unmute: Use prev volume or default to 0.5 if prev was invalid
+      const newVolume = (prevVolume > 0 && prevVolume <= 1) ? prevVolume : 0.5;
+      setVolume(newVolume);
       setIsMuted(false);
     } else {
-      setPrevVolume(volume);
+      // Store current volume only if it's valid
+      if (safeVolume > 0) {
+        setPrevVolume(safeVolume);
+      }
       setVolume(0);
       setIsMuted(true);
     }
-  }, [isMuted, volume, prevVolume, setVolume]);
+  }, [isMuted, safeVolume, prevVolume, setVolume]);
 
   /**
    * Safely get album art or a default placeholder
@@ -240,19 +266,18 @@ const Player = ({ children }) => {
     if (!currentTrack) return '/default-album-art.png';
     const imagePath = currentTrack.track_image || currentTrack.album_art;
     if (!imagePath) return '/default-album-art.png';
-    if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
-      return imagePath;
-    }
-    return MusicAPI.getImage('albumArt', imagePath);
+  if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+    return imagePath;
+  }
+  return MusicAPI.getImage('albumArt', imagePath);
   }, [currentTrack]);
 
-  // Common props for sub-components
-  const playerProps = {
+  // Stable props that don't change frequently - memoized for performance
+  // NOTE: currentTime and duration are passed separately to avoid re-rendering everything
+  const stablePlayerProps = useMemo(() => ({
     currentTrack,
     getTrackImage,
     formatTime,
-    currentTime,
-    duration,
     seek,
     togglePlay,
     playNext,
@@ -274,106 +299,130 @@ const Player = ({ children }) => {
     isMobile,
     audioContext,
     analyzerNode,
-    tutorialShown
-  };
+    tutorialShown,
+    volume: safeVolume,
+    handleVolumeChange,
+    toggleMute,
+    isMuted
+  }), [
+    currentTrack, getTrackImage, formatTime,
+    seek, togglePlay, playNext, playPrevious, toggleShuffle, toggleRepeat,
+    shuffle, repeat, loading, isPlaying, isLiked, toggleLike,
+    showQueue, showLyrics, showEQ,
+    isMobile, audioContext, analyzerNode, tutorialShown,
+    safeVolume, handleVolumeChange, toggleMute, isMuted
+  ]);
+
+  // For mobile devices, we conditionally render EQPopup to improve performance
+  const shouldRenderEQ = useMemo(() => {
+    // Only render EQ when it's actually shown to save resources on mobile
+    if (!showEQ && isMobile) return false;
+    return true;
+  }, [showEQ, isMobile]);
+
+  // Toggle queue visibility function
+  const toggleQueue = useCallback(() => {
+    setShowQueue(prev => !prev);
+  }, []);
 
   return (
     <>
-      {/** EXPANDED PLAYER **/}
+    {/** EXPANDED PLAYER **/}
+    <AnimatePresence>
+    {showExpanded && (
+      <ExpandedPlayer
+        {...stablePlayerProps}
+        currentTime={currentTime}
+        duration={duration}
+        onClose={() => setShowExpanded(false)}
+        setShowPlaylistModal={setShowPlaylistModal}
+      />
+    )}
+    </AnimatePresence>
+
+    {/** MINI PLAYER **/}
+    <AnimatePresence>
+    {!showExpanded && (
+      <MiniPlayer
+        {...stablePlayerProps}
+        currentTime={currentTime}
+        duration={duration}
+        setShowExpanded={setShowExpanded}
+      />
+    )}
+    </AnimatePresence>
+
+    {/** QUEUE PANEL (desktop) **/}
+    {!isMobile && (
       <AnimatePresence>
-        {showExpanded && (
-          <ExpandedPlayer
-            {...playerProps}
-            onClose={() => setShowExpanded(false)}
-            setShowPlaylistModal={setShowPlaylistModal}
-          />
-        )}
-      </AnimatePresence>
-
-      {/** MINI PLAYER **/}
-      <AnimatePresence>
-        {!showExpanded && (
-          <MiniPlayer
-            {...playerProps}
-            setShowExpanded={setShowExpanded}
-            volume={volume}
-            handleVolumeChange={handleVolumeChange}
-            toggleMute={toggleMute}
-            isMuted={isMuted}
-          />
-        )}
-      </AnimatePresence>
-
-      {/** QUEUE PANEL (desktop) **/}
-      {!isMobile && (
-        <AnimatePresence>
-          {showQueue && (
-            <QueuePanel
-              queue={queue}
-              showExpanded={showExpanded}
-              setShowQueue={setShowQueue}
-              removeFromQueue={removeFromQueue}
-              clearQueue={clearQueue}
-            />
-          )}
-        </AnimatePresence>
-      )}
-
-      {/** QUEUE PANEL (mobile) **/}
-      {isMobile && (
-        <MobileQueuePanel
-          queue={queue}
-          showQueue={showQueue}
-          setShowQueue={setShowQueue}
-          removeFromQueue={removeFromQueue}
-          clearQueue={clearQueue}
+      {showQueue && (
+        <QueuePanel
+        queue={queue}
+        showExpanded={showExpanded}
+        setShowQueue={setShowQueue}
+        removeFromQueue={removeFromQueue}
+        clearQueue={clearQueue}
+        showQueue={showQueue}
         />
       )}
-
-      {/** PLAYLIST SELECTOR **/}
-      <AnimatePresence>
-        {showPlaylistModal && currentTrack && (
-          <PlaylistSelectorModal
-            currentTrack={currentTrack}
-            onClose={() => setShowPlaylistModal(false)}
-            isMobile={isMobile}
-          />
-        )}
       </AnimatePresence>
+    )}
 
-      {/** LYRICS PANEL **/}
-      <LyricsPanel
-        showLyrics={showLyrics}
-        setShowLyrics={setShowLyrics}
-        showExpanded={showExpanded}
-        lyrics={currentTrack?.lyrics}
-        currentTime={currentTime}
-        isMobile={isMobile}
+    {/** QUEUE PANEL (mobile) **/}
+    {isMobile && (
+      <MobileQueuePanel
+      queue={queue}
+      showQueue={showQueue}
+      setShowQueue={setShowQueue}
+      removeFromQueue={removeFromQueue}
+      clearQueue={clearQueue}
       />
+    )}
 
-      {/** EQ POPUP **/}
-      <EQPopup showEQ={showEQ} setShowEQ={setShowEQ} isMobile={isMobile} />
+    {/** PLAYLIST SELECTOR **/}
+    <AnimatePresence>
+    {showPlaylistModal && currentTrack && (
+      <PlaylistSelectorModal
+      currentTrack={currentTrack}
+      onClose={() => setShowPlaylistModal(false)}
+      isMobile={isMobile}
+      />
+    )}
+    </AnimatePresence>
 
-      {/** ERROR TOAST **/}
-      <AnimatePresence>
-        {error && (
-          <ErrorToast
-            error={error}
-            showExpanded={showExpanded}
-            isMobile={isMobile}
-          />
-        )}
-      </AnimatePresence>
+    {/** LYRICS PANEL **/}
+    <LyricsPanel
+      showLyrics={showLyrics}
+      setShowLyrics={setShowLyrics}
+      showExpanded={showExpanded}
+      lyrics={currentTrack?.lyrics}
+      currentTime={currentTime}
+      seek={seek}
+      isMobile={isMobile}
+    />
 
-      {/** MAIN CONTENT (below the player) **/}
-      <div
-        className={`${!showExpanded ? (isMobile ? 'mb-32' : 'mb-24') : ''}`}
-        onClick={handleBackgroundTap}
-      >
-        {children}
-      </div>
+    {/** EQ POPUP - Conditionally rendered for performance **/}
+    {shouldRenderEQ && (
+      <EQPopup
+      showEQ={showEQ}
+      setShowEQ={setShowEQ}
+      isMobile={isMobile}
+      />
+    )}
+
+    {/** ERROR TOAST **/}
+    <AnimatePresence>
+    {error && (
+      <ErrorToast
+      error={error}
+      showExpanded={showExpanded}
+      isMobile={isMobile}
+      />
+    )}
+    </AnimatePresence>
+
     </>
   );
 };
 
-export default Player;
+export default React.memo(Player);

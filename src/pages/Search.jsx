@@ -1,24 +1,157 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useDeferredValue,
+  useMemo,
+  useRef,
+} from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   Search as SearchIcon,
   Play,
   Pause,
-  Clock,
   ChevronRight,
   Loader,
   Music,
   User,
 } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
+import VirtualList from '../components/shared/VirtualList';
 
 const DEFAULT_ALBUM_ART = '/default-album-art.png';
 const DEFAULT_PROFILE_PIC = '/default-profile-pic.png';
+const TRACK_ROW_HEIGHT = 86;
+
+// Track result row
+const TrackResult = React.memo(({
+  track,
+  index,
+  currentTrackId,
+  isPlaying,
+  onTrackAction,
+  getImageUrl,
+}) => {
+  const isCurrentTrack = currentTrackId === track.id;
+  const imageUrl = getImageUrl('albumArt', track.album_art);
+
+  const handleClick = useCallback(() => {
+    onTrackAction(track, isCurrentTrack);
+  }, [isCurrentTrack, onTrackAction, track]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.03 }}
+      className="group grid grid-cols-[auto,4fr,2fr,1fr] gap-4 items-center px-4 py-2 rounded-md hover:bg-surface-light"
+      role="listitem"
+    >
+      <div className="flex items-center justify-center w-8">
+        <button onClick={handleClick} className="text-gray-400 hover:text-white">
+          {isCurrentTrack && isPlaying ? <Pause size={16} /> : <Play size={16} />}
+        </button>
+      </div>
+      <div className="flex items-center gap-4">
+        <div className="relative w-12 h-12 bg-surface rounded overflow-hidden">
+          {imageUrl ? (
+            <img
+              src={imageUrl}
+              alt={track.title}
+              className="w-full h-full object-cover"
+              loading="lazy"
+              onError={(e) => {
+                e.target.src = DEFAULT_ALBUM_ART;
+              }}
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center">
+              <Music size={24} className="text-white/20" />
+            </div>
+          )}
+        </div>
+        <div>
+          <div className={`font-medium ${isCurrentTrack ? 'text-accent' : ''}`}>
+            {track.title}
+          </div>
+          <Link to={`/profile/${track.user_id}`} className="text-sm text-gray-400 hover:text-white">
+            {track.artist}
+          </Link>
+        </div>
+      </div>
+      <div className="text-gray-400 truncate">{track.album_title || 'Single'}</div>
+      <div className="text-sm text-gray-400 text-right">{track.duration}</div>
+    </motion.div>
+  );
+});
+
+// Artist card
+const ArtistResult = React.memo(({ artist, getImageUrl }) => {
+  const imageUrl = getImageUrl('profilePics', artist.profile_pic) + '?h=232';
+  return (
+    <Link
+      to={`/profile/${artist.id}`}
+      className="p-4 bg-surface rounded-lg block hover:bg-surface-light transition-colors"
+    >
+      <div className="w-full aspect-square mb-4 rounded-full overflow-hidden bg-surface">
+        {imageUrl ? (
+          <img
+            src={imageUrl}
+            alt={artist.username}
+            className="w-full h-full object-cover"
+            loading="lazy"
+            onError={(e) => {
+              e.target.src = DEFAULT_PROFILE_PIC;
+            }}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <User size={32} className="text-white/20" />
+          </div>
+        )}
+      </div>
+      <h3 className="font-medium text-center truncate">{artist.username}</h3>
+      <p className="text-sm text-gray-400 text-center">Artist</p>
+    </Link>
+  );
+});
+
+// Album card
+const AlbumResult = React.memo(({ album, getImageUrl }) => {
+  const imageUrl = getImageUrl('albumArt', album.album_art) + '?h=232';
+  return (
+    <Link
+      to={`/album/${album.id}`}
+      className="p-4 bg-surface rounded-lg block hover:bg-surface-light transition-colors"
+    >
+      <div className="w-full aspect-square mb-4 rounded overflow-hidden bg-surface">
+        {imageUrl ? (
+          <img
+            src={imageUrl}
+            alt={album.title}
+            className="w-full h-full object-cover"
+            loading="lazy"
+            onError={(e) => {
+              e.target.src = DEFAULT_ALBUM_ART;
+            }}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <Music size={32} className="text-white/20" />
+          </div>
+        )}
+      </div>
+      <h3 className="font-medium truncate">{album.title}</h3>
+      <p className="text-sm text-gray-400 truncate">{album.artist}</p>
+    </Link>
+  );
+});
 
 const Search = () => {
   const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -28,160 +161,108 @@ const Search = () => {
   const [showAllArtists, setShowAllArtists] = useState(false);
   const [showAllAlbums, setShowAllAlbums] = useState(false);
 
-  const handleSearch = useCallback(async (searchQuery) => {
-    if (!searchQuery.trim()) {
-      setResults(null);
-      return;
-    }
-    setLoading(true);
-    setError('');
+  const abortRef = useRef(null);
 
-    try {
-      const response = await MusicAPI.search(searchQuery);
-      setResults(response.data);
-    } catch (err) {
-      setError('Error fetching search results');
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { togglePlay, playTrack } = useAudio();
+  const currentTrackId = currentTrack?.id;
+
+  const getImageUrl = useCallback((folder, filename) => {
+    if (!filename) return '';
+    return MusicAPI.getImage(folder, filename);
   }, []);
 
-  useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      if (query) handleSearch(query);
-    }, 300);
-
-    return () => clearTimeout(timeoutId);
-  }, [query, handleSearch]);
-
-  // Helper to get image URLs from the API
-  const getImageUrl = (folder, filename) => {
-    if (!filename) return null;
-    return MusicAPI.getImage(folder, filename);
-  };
-
-  // ----------------- Memoized Child Components -----------------
-
-  // Track result component (memoized)
-  const TrackResult = React.memo(({ track, index }) => {
-    const { currentTrack, isPlaying, togglePlay, playTrack } = useAudio();
-    const isCurrentTrack = currentTrack?.id === track.id;
-    const imageUrl = getImageUrl('albumArt', track.album_art);
-
-    const handleClick = useCallback(() => {
-      if (isCurrentTrack) {
+  const handleTrackAction = useCallback(
+    (track, isCurrent) => {
+      if (!track) return;
+      if (isCurrent) {
         togglePlay();
       } else {
         playTrack(track);
       }
-    }, [isCurrentTrack, togglePlay, playTrack, track]);
+    },
+    [playTrack, togglePlay]
+  );
 
-    return (
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: index * 0.05 }}
-        className="group grid grid-cols-[auto,4fr,2fr,1fr] gap-4 items-center px-4 py-2 rounded-md hover:bg-surface-light"
-      >
-        <div className="flex items-center justify-center w-8">
-          <button onClick={handleClick} className="text-gray-400 hover:text-white">
-            {isCurrentTrack && isPlaying ? <Pause size={16} /> : <Play size={16} />}
-          </button>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="relative w-12 h-12 bg-surface rounded overflow-hidden">
-            {imageUrl ? (
-              <img
-                src={imageUrl}
-                alt={track.title}
-                className="w-full h-full object-cover"
-                onError={(e) => {
-                  e.target.src = DEFAULT_ALBUM_ART;
-                }}
-              />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center">
-                <Music size={24} className="text-white/20" />
-              </div>
-            )}
-          </div>
-          <div>
-            <div className={`font-medium ${isCurrentTrack ? 'text-accent' : ''}`}>
-              {track.title}
-            </div>
-            <Link to={`/profile/${track.user_id}`} className="text-sm text-gray-400 hover:text-white">
-              {track.artist}
-            </Link>
-          </div>
-        </div>
-        <div className="text-gray-400">{track.album_title || 'Single'}</div>
-        <div className="text-sm text-gray-400 text-right">{track.duration}</div>
-      </motion.div>
-    );
-  });
+  const handleSearch = useCallback(async (searchQuery, signal) => {
+    if (!searchQuery.trim()) {
+      setResults(null);
+      setLoading(false);
+      return;
+    }
 
-  // Artist result component (memoized)
-  const ArtistResult = React.memo(({ artist }) => {
-    const imageUrl = getImageUrl('profilePics', artist.profile_pic) + "?h=232";
-    return (
-      <Link
-        to={`/profile/${artist.id}`}
-        className="p-4 bg-surface rounded-lg block hover:bg-surface-light transition-colors"
-      >
-        <div className="w-full aspect-square mb-4 rounded-full overflow-hidden bg-surface">
-          {imageUrl ? (
-            <img
-              src={imageUrl}
-              alt={artist.username}
-              className="w-full h-full object-cover"
-              onError={(e) => {
-                e.target.src = DEFAULT_PROFILE_PIC;
-              }}
-            />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center">
-              <User size={32} className="text-white/20" />
-            </div>
-          )}
-        </div>
-        <h3 className="font-medium text-center truncate">{artist.username}</h3>
-        <p className="text-sm text-gray-400 text-center">Artist</p>
-      </Link>
-    );
-  });
+    setLoading(true);
+    setError('');
 
-  // Album result component (memoized)
-  const AlbumResult = React.memo(({ album }) => {
-    const imageUrl = getImageUrl('albumArt', album.album_art) + "?h=232";
-    return (
-      <Link
-        to={`/album/${album.id}`}
-        className="p-4 bg-surface rounded-lg block hover:bg-surface-light transition-colors"
-      >
-        <div className="w-full aspect-square mb-4 rounded overflow-hidden bg-surface">
-          {imageUrl ? (
-            <img
-              src={imageUrl}
-              alt={album.title}
-              className="w-full h-full object-cover"
-              onError={(e) => {
-                e.target.src = DEFAULT_ALBUM_ART;
-              }}
-            />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center">
-              <Music size={32} className="text-white/20" />
-            </div>
-          )}
-        </div>
-        <h3 className="font-medium truncate">{album.title}</h3>
-        <p className="text-sm text-gray-400 truncate">{album.artist}</p>
-      </Link>
-    );
-  });
+    try {
+      const response = await MusicAPI.search(searchQuery, { signal });
+      if (!signal?.aborted) {
+        setResults(response.data);
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+      setError('Error fetching search results');
+      console.error(err);
+    } finally {
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
+    }
+  }, []);
 
-  // ----------------- Main Render -----------------
+  useEffect(() => {
+    const trimmed = deferredQuery.trim();
+
+    // Cancel any inflight request
+    abortRef.current?.abort();
+
+    if (!trimmed) {
+      setResults(null);
+      setError('');
+      setLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const debounceId = setTimeout(() => handleSearch(trimmed, controller.signal), 200);
+
+    return () => {
+      clearTimeout(debounceId);
+      controller.abort();
+    };
+  }, [deferredQuery, handleSearch]);
+
+  const trackList = useMemo(() => {
+    if (!results?.tracks?.length) return [];
+    if (results.tracks.length > 5 && !showAllTracks) {
+      return results.tracks.slice(0, 5);
+    }
+    return results.tracks;
+  }, [results?.tracks, showAllTracks]);
+
+  const shouldVirtualizeTracks = trackList.length > 14 || showAllTracks;
+  const trackListHeight = Math.max(
+    TRACK_ROW_HEIGHT * Math.min(trackList.length || 1, 12) + 12,
+    TRACK_ROW_HEIGHT * 3
+  );
+
+  const renderTrackItem = useCallback(
+    (track, index) => (
+      <div key={track.id} style={{ height: TRACK_ROW_HEIGHT }} className="flex items-stretch">
+        <TrackResult
+          track={track}
+          index={index}
+          currentTrackId={currentTrackId}
+          isPlaying={isPlaying}
+          onTrackAction={handleTrackAction}
+          getImageUrl={getImageUrl}
+        />
+      </div>
+    ),
+    [currentTrackId, getImageUrl, handleTrackAction, isPlaying]
+  );
 
   return (
     <div className="min-h-full p-8">
@@ -212,7 +293,7 @@ const Search = () => {
       {results && !loading && (
         <div className="space-y-8">
           {/* Songs Section */}
-          {results.tracks?.length > 0 && (
+          {trackList.length > 0 && (
             <div>
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-2xl font-bold">Songs</h2>
@@ -225,14 +306,19 @@ const Search = () => {
                   </button>
                 )}
               </div>
-              <div className="space-y-1">
-                {(results.tracks.length > 5 && !showAllTracks
-                  ? results.tracks.slice(0, 5)
-                  : results.tracks
-                ).map((track, index) => (
-                  <TrackResult key={track.id} track={track} index={index} />
-                ))}
-              </div>
+              {shouldVirtualizeTracks ? (
+                <VirtualList
+                  items={trackList}
+                  itemHeight={TRACK_ROW_HEIGHT}
+                  height={trackListHeight}
+                  renderItem={renderTrackItem}
+                  innerClassName="space-y-1"
+                />
+              ) : (
+                <div className="space-y-1">
+                  {trackList.map((track, index) => renderTrackItem(track, index))}
+                </div>
+              )}
             </div>
           )}
 
@@ -260,7 +346,7 @@ const Search = () => {
                     initial={{ opacity: 0, scale: 0.9 }}
                     animate={{ opacity: 1, scale: 1 }}
                   >
-                    <ArtistResult artist={artist} />
+                    <ArtistResult artist={artist} getImageUrl={getImageUrl} />
                   </motion.div>
                 ))}
               </div>
@@ -291,7 +377,7 @@ const Search = () => {
                     initial={{ opacity: 0, scale: 0.9 }}
                     animate={{ opacity: 1, scale: 1 }}
                   >
-                    <AlbumResult album={album} />
+                    <AlbumResult album={album} getImageUrl={getImageUrl} />
                   </motion.div>
                 ))}
               </div>

@@ -88,4 +88,4 @@ const SeekBar = ({
   );
 };
 
-export default SeekBar;
+export default React.memo(SeekBar);

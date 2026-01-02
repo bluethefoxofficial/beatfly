@@ -14,7 +14,7 @@ import {
   Music,
   Plus
 } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
 
 // Toast notification component
@@ -39,7 +39,9 @@ const Toast = ({ message, isVisible }) => (
 const PlaylistDetail = () => {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { playTrack, currentTrack, isPlaying, togglePlay } = useAudio();
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay } = useAudio();
   const [playlist, setPlaylist] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');

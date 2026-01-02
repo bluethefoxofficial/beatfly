@@ -138,4 +138,4 @@ const PlaybackControls = ({
   );
 };
 
-export default PlaybackControls;
+export default React.memo(PlaybackControls);

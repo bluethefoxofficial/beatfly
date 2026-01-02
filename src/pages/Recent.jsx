@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Clock, Play, Pause } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import { Link } from 'react-router-dom';
 import MusicAPI from '../services/api';
 import { motion } from 'framer-motion';
@@ -10,7 +10,9 @@ import { useResponsive } from '../components/layout/MainLayout'; // Import respo
 const Recent = () => {
   const [recentTracks, setRecentTracks] = useState([]);
   const [loading, setLoading] = useState(true);
-  const { playTrack, currentTrack, isPlaying, togglePlay } = useAudio();
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay } = useAudio();
   const { isMobile } = useResponsive(); // Get mobile state from context
 
   useEffect(() => {

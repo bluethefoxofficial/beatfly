@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';
 import TitleBar from './TitleBar';
 import Sidebar from './Sidebar';
 import Player from './Player/index';
+import PlaybackSync from '../shared/PlaybackSync';
 
 // Create contexts for sidebar and responsive state
 export const SidebarContext = createContext(null);
@@ -56,28 +57,39 @@ const MainLayout = () => {
   return (
     <ResponsiveContext.Provider value={{ isMobile }}>
       <SidebarContext.Provider value={{ isCollapsed, setIsCollapsed }}>
-        <div className="flex flex-col h-screen bg-background">
-          {/* Only show TitleBar on desktop */}
-          {!isMobile && <TitleBar />}
-
-          {/* Main content wrapper */}
-          <div className="flex flex-1 overflow-hidden">
-            {/* Main content area with conditional margin for desktop */}
-            <motion.main
-              initial={false}
-              animate={{
-                marginLeft: isMobile ? 0 : (isCollapsed ? '5rem' : '16rem')
-              }}
-              transition={{ duration: 0.3, ease: 'easeInOut' }}
-              className={`flex-1 overflow-y-auto ${isMobile ? 'pb-32' : 'pb-24'}`}
-            >
-              <Outlet />
-            </motion.main>
+        <div className="relative flex flex-col h-screen text-white overflow-hidden">
+          <PlaybackSync />
+          {/* Ambient background */}
+          <div className="pointer-events-none absolute inset-0">
+            <div className="absolute inset-0 bg-gradient-to-br from-white/5 via-transparent to-white/5" />
+            <div className="absolute -left-40 top-10 w-[380px] h-[380px] bg-accent/30 blur-[140px] opacity-60" />
+            <div className="absolute -right-24 top-24 w-[300px] h-[300px] bg-indigo-500/25 blur-[140px]" />
+            <div className="absolute -bottom-32 left-10 w-[320px] h-[320px] bg-emerald-400/20 blur-[140px]" />
           </div>
 
-          {/* Player & Sidebar */}
-          <Player />
-          <Sidebar />
+          <div className="relative flex flex-col h-full bg-background/70 backdrop-blur-xl">
+            {/* Only show TitleBar on desktop */}
+            {!isMobile && <TitleBar />}
+
+            {/* Main content wrapper */}
+            <div className="flex flex-1 overflow-hidden">
+              {/* Main content area with conditional margin for desktop */}
+              <motion.main
+                initial={false}
+                animate={{
+                  marginLeft: isMobile ? 0 : (isCollapsed ? '5rem' : '16rem')
+                }}
+                transition={{ duration: 0.3, ease: 'easeInOut' }}
+                className={`relative z-10 flex-1 overflow-y-auto ${isMobile ? 'pb-[148px]' : 'pb-[72px]'}`}
+              >
+                <Outlet />
+              </motion.main>
+            </div>
+
+            {/* Player & Sidebar */}
+            <Player />
+            <Sidebar />
+          </div>
         </div>
       </SidebarContext.Provider>
     </ResponsiveContext.Provider>

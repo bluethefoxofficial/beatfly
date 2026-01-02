@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "electron:dev": "cross-env NODE_ENV=development concurrently \"vite\" \"wait-on tcp:3000 && electron .\"",
-    "electron:build": "vite build && electron-builder"
+    "electron:build": "cross-env ELECTRON=true vite build && electron-builder",
+    "electron:build:flatpak": "cross-env ELECTRON=true vite build && electron-builder --linux flatpak"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",
@@ -32,8 +33,11 @@
     "react-colorful": "^5.6.1",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.1.5",
+    "socket.io-client": "^4.8.3",
     "tailwind-merge": "^3.0.1",
-    "wait-on": "^8.0.2"
+    "three": "^0.178.0",
+    "wait-on": "^8.0.2",
+    "zustand": "^5.0.9"
   },
   "devDependencies": {
     "@eslint/js": "^9.19.0",
@@ -60,7 +64,8 @@
     "productName": "Beatfly",
     "files": [
       "dist/**/*",
-      "electron/**/*"
+      "electron/**/*",
+      "assets/**/*"
     ],
     "directories": {
       "buildResources": "assets",
@@ -86,9 +91,11 @@
     "linux": {
       "target": [
         "AppImage",
-        "deb"
+        "deb",
+        "flatpak"
       ],
-      "category": "Media"
+      "category": "Media",
+      "icon": "assets/icon.png"
     }
   }
 }

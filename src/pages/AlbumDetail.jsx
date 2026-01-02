@@ -1,9 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { Play, Pause, Heart, Clock, Share2, Plus, ListMusic, Disc, Sparkles } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { Play, Pause, Heart, Clock, Share2, Plus, ListMusic, Disc, Sparkles, ThumbsDown } from 'lucide-react';
+import { useAudio, useCurrentTrack, useIsPlaying, useQueue } from '../contexts/AudioContext';
 import { motion, AnimatePresence } from 'framer-motion';
 import MusicAPI from '../services/api';
+
+const buildImageUrl = (path, size = 320) => {
+  if (!path) return '/default-album-art.png';
+  const clean = path.split('?')[0];
+
+  if (clean.startsWith('http')) {
+    return clean.includes('?') ? `${clean}&w=${size}` : `${clean}?w=${size}`;
+  }
+
+  const filename = clean.split('/').pop();
+  return `${MusicAPI.getImage('albumArt', filename)}?w=${size}`;
+};
 
 // Enhanced Explicit Icon
 const ExplicitIcon = ({ size = 20, className = '' }) => (
@@ -64,9 +76,15 @@ const AlbumDetail = () => {
   const [album, setAlbum] = useState(null);
   const [artistProfile, setArtistProfile] = useState(null);
   const [isLiked, setIsLiked] = useState(false);
+  const [likedTracks, setLikedTracks] = useState(new Set());
+  const [dislikedTracks, setDislikedTracks] = useState(new Set());
   const [hoveredTrack, setHoveredTrack] = useState(null);
   const [loading, setLoading] = useState(true);
-  const { currentTrack, isPlaying, playTrack, togglePlay, addToQueue } = useAudio();
+  const [error, setError] = useState('');
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay, addToQueue } = useAudio();
+  const queue = useQueue();
   const [toast, setToast] = useState({ visible: false, message: '' });
 
   const [windowWidth, setWindowWidth] = useState(window.innerWidth);
@@ -79,7 +97,71 @@ const AlbumDetail = () => {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    const fetchAlbumDetails = async () => {
+      try {
+        setLoading(true);
+        setError('');
+
+        const response = await MusicAPI.getAlbum(albumId);
+        const data = response.data;
+
+        if (cancelled) return;
+        setAlbum(data);
+
+        const artistPromise = data.user_id
+          ? MusicAPI.getArtistProfile(data.user_id).catch(() => null)
+          : Promise.resolve(null);
+
+        const token = localStorage.getItem('token');
+        const favouritePromise = token
+          ? fetch(
+            `https://api.beatfly-music.xyz/xrpc/music/favourite.album/check/${albumId}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          ).then(res => res.ok ? res.json() : null).catch(() => null)
+          : Promise.resolve(null);
+
+        const favoriteTracksPromise = MusicAPI.getFavoriteTracks().catch(() => ({ data: { tracks: [] } }));
+        const dislikedTracksPromise = MusicAPI.getDislikedTracks().catch(() => ({ data: { tracks: [] } }));
+
+        const [artistResponse, likeData, favoritesResponse, dislikedResponse] = await Promise.all([
+          artistPromise,
+          favouritePromise,
+          favoriteTracksPromise,
+          dislikedTracksPromise,
+        ]);
+
+        if (cancelled) return;
+        if (artistResponse?.data) {
+          setArtistProfile(artistResponse.data);
+        }
+        if (likeData && typeof likeData.isLiked === 'boolean') {
+          setIsLiked(!!likeData.isLiked);
+        }
+
+        const likedIds = new Set(favoritesResponse.data.tracks.map(t => t.id));
+        setLikedTracks(likedIds);
+
+        const dislikedIds = new Set(dislikedResponse.data.tracks.map(t => t.id));
+        setDislikedTracks(dislikedIds);
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Error fetching album details:', error);
+          setError('Failed to load album details');
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
     fetchAlbumDetails();
+
+    return () => {
+      cancelled = true;
+    };
   }, [albumId]);
 
   const showToast = (message) => {
@@ -89,66 +171,110 @@ const AlbumDetail = () => {
 
   const addAlbumToQueue = () => {
     if (album && album.tracks.length > 0) {
-      addToQueue(album.tracks);
+      const queuedTracks = album.tracks.map(t => ({
+        ...t,
+        album_art: t.album_art || album.album_art,
+      }));
+      addToQueue(queuedTracks);
       showToast(`Added ${album.tracks.length} tracks to queue`);
     }
   };
 
   const addTrackToQueue = (track, event) => {
     event.stopPropagation();
-    addToQueue(track);
+    addToQueue({
+      ...track,
+      album_art: track.album_art || album?.album_art,
+    });
     showToast(`Added "${track.title}" to queue`);
   };
 
-  const fetchAlbumDetails = async () => {
-    try {
-      setLoading(true);
-      const response = await MusicAPI.getAlbum(albumId);
-      const data = response.data;
-      setAlbum(data);
+  const heroArt = useMemo(
+    () => buildImageUrl(album?.album_art, 420),
+    [album?.album_art]
+  );
 
-      if (data.user_id) {
-        const artistResponse = await MusicAPI.getArtistProfile(data.user_id);
-        setArtistProfile(artistResponse.data);
-      }
+  const coverArt = useMemo(
+    () => buildImageUrl(album?.album_art, 232),
+    [album?.album_art]
+  );
 
-      const token = localStorage.getItem('token');
-      if (token) {
-        const likeResponse = await fetch(
-          `https://api.beatfly-music.xyz/xrpc/music/favourite.album/check/${albumId}`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        const likeData = await likeResponse.json();
-        setIsLiked(likeData.isLiked);
-      }
-    } catch (error) {
-      console.error('Error fetching album details:', error);
-    } finally {
-      setLoading(false);
-    }
+  const tracks = useMemo(
+    () => (album?.tracks || []).map((t) => ({
+      ...t,
+      album_art: t.album_art || album?.album_art,
+    })),
+    [album]
+  );
+
+  const formatDuration = (value) => {
+    if (!value) return '0:00';
+    const minutes = Math.floor(value / 60);
+    const seconds = Math.floor(value % 60).toString().padStart(2, '0');
+    return `${minutes}:${seconds}`;
   };
 
   const toggleLike = async () => {
     try {
       const token = localStorage.getItem('token');
-      const method = isLiked ? 'DELETE' : 'POST';
-      const endpoint = isLiked
-      ? `/music/favourite.album/${albumId}`
-      : '/music/favourite.album';
+      if (!token) {
+        showToast('Log in to manage favorites');
+        return;
+      }
 
-      await fetch(`https://api.beatfly-music.xyz/xrpc${endpoint}`, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: !isLiked ? JSON.stringify({ albumId }) : undefined
-      });
+      if (isLiked) {
+        await MusicAPI.unfavoriteAlbum(albumId);
+      } else {
+        await MusicAPI.favoriteAlbum(albumId);
+      }
 
-      setIsLiked(!isLiked);
+      setIsLiked(prev => !prev);
       showToast(isLiked ? 'Removed from favorites' : 'Added to favorites');
     } catch (error) {
       console.error('Error toggling like:', error);
+      showToast('Could not update favorite');
+    }
+  };
+
+  const toggleLikeTrack = async (trackId, event) => {
+    event.stopPropagation();
+    try {
+        if (likedTracks.has(trackId)) {
+            await MusicAPI.unfavoriteTrack(trackId);
+            setLikedTracks(prev => {
+                const newSet = new Set(prev);
+                newSet.delete(trackId);
+                return newSet;
+            });
+            showToast('Removed from favorites');
+        } else {
+            await MusicAPI.favoriteTrack(trackId);
+            setLikedTracks(prev => new Set(prev).add(trackId));
+            showToast('Added to favorites');
+        }
+    } catch (err) {
+        console.error('Error toggling like:', err);
+    }
+  };
+
+  const toggleDislike = async (trackId, event) => {
+    event.stopPropagation();
+    try {
+      if (dislikedTracks.has(trackId)) {
+        await MusicAPI.removeDislike(trackId);
+        setDislikedTracks(prev => {
+            const newSet = new Set(prev);
+            newSet.delete(trackId);
+            return newSet;
+        });
+        showToast('Removed from dislikes');
+      } else {
+        await MusicAPI.dislikeTrack(trackId);
+        setDislikedTracks(prev => new Set(prev).add(trackId));
+        showToast('Added to dislikes');
+      }
+    } catch (err) {
+      console.error('Error toggling dislike:', err);
     }
   };
 
@@ -178,6 +304,22 @@ const AlbumDetail = () => {
     );
   }
 
+  if (error) {
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <p className="text-red-400">{error}</p>
+          <button
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 rounded bg-accent text-white hover:bg-accent/90 transition-colors"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!album) {
     return (
       <div className="flex-1 flex items-center justify-center">
@@ -200,7 +342,7 @@ const AlbumDetail = () => {
     {/* Background Image with Blur */}
     <div className="absolute inset-0 h-96">
     <img
-    src={album.album_art + "?w=200"}
+    src={heroArt}
     alt=""
     className="w-full h-full object-cover"
     />
@@ -219,7 +361,7 @@ const AlbumDetail = () => {
     className="flex-shrink-0"
     >
     <img
-    src={album.album_art + "?w=232"}
+    src={coverArt}
     alt={album.title}
     className="w-56 h-56 shadow-2xl rounded"
     />
@@ -351,7 +493,7 @@ const AlbumDetail = () => {
 
     {/* Tracks */}
     <div>
-    {album.tracks.map((track, index) => (
+    {tracks.map((track, index) => (
       <motion.div
       key={track.id}
       initial={{ opacity: 0, x: -20 }}
@@ -400,13 +542,27 @@ const AlbumDetail = () => {
         </div>
 
         <div className="flex items-center justify-between text-gray-400 text-sm">
-        <span>{track.duration || '0:00'}</span>
-        <button
-        onClick={(e) => addTrackToQueue(track, e)}
-        className="opacity-0 group-hover:opacity-100 transition-opacity p-2"
-        >
-        <Plus size={16} />
-        </button>
+        <span>{formatDuration(track.duration)}</span>
+        <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
+            <button
+                onClick={(e) => toggleLikeTrack(track.id, e)}
+                className={`p-2 ${likedTracks.has(track.id) ? 'text-accent' : ''}`}
+            >
+                <Heart size={16} fill={likedTracks.has(track.id) ? 'currentColor' : 'none'} />
+            </button>
+            <button
+                onClick={(e) => toggleDislike(track.id, e)}
+                className={`p-2 ${dislikedTracks.has(track.id) ? 'text-red-500' : ''}`}
+            >
+                <ThumbsDown size={16} fill={dislikedTracks.has(track.id) ? 'currentColor' : 'none'} />
+            </button>
+            <button
+                onClick={(e) => addTrackToQueue(track, e)}
+                className="p-2"
+            >
+                <Plus size={16} />
+            </button>
+        </div>
         </div>
         </motion.div>
     ))}
@@ -414,23 +570,30 @@ const AlbumDetail = () => {
 
     {/* Album Info Section */}
     <div className="mt-12 grid grid-cols-1 md:grid-cols-2 gap-8 text-sm">
-    <div>
-    <h3 className="text-white/60 mb-2">Released</h3>
-    <p className="text-white">
-    {new Date(album.created_at).toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric'
-    })}
-    </p>
-    </div>
-
-    {album.description && (
       <div>
-      <h3 className="text-white/60 mb-2">About</h3>
-      <p className="text-white/80 leading-relaxed">{album.description}</p>
+        <h3 className="text-white/60 mb-2">Released</h3>
+        <p className="text-white">
+          {new Date(album.created_at).toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+          })}
+        </p>
       </div>
-    )}
+
+      {album.description && (
+        <div>
+          <h3 className="text-white/60 mb-2">About Album</h3>
+          <p className="text-white/80 leading-relaxed">{album.description}</p>
+        </div>
+      )}
+
+      {artistProfile?.bio && (
+        <div>
+          <h3 className="text-white/60 mb-2">About the Artist ({artistProfile.stage_name})</h3>
+          <p className="text-white/80 leading-relaxed">{artistProfile.bio}</p>
+        </div>
+      )}
     </div>
     </div>
     </div>
@@ -440,4 +603,4 @@ const AlbumDetail = () => {
   );
 };
 
-export default AlbumDetail;
+export default React.memo(AlbumDetail);

@@ -8,13 +8,15 @@ import {
   Trash2,
   Loader
 } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
 
 const AlbumEditor = () => {
   const { albumId } = useParams();
   const navigate = useNavigate();
-  const { playTrack, currentTrack, isPlaying, togglePlay } = useAudio();
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay } = useAudio();
   
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);

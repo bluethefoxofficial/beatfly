@@ -1,24 +1,69 @@
 // src/contexts/AudioContext.jsx
+// Refactored to use Zustand for efficient state management
+// Components subscribe only to the state they need, preventing unnecessary re-renders
 
 import React, {
   createContext,
   useContext,
   useRef,
-  useState,
   useEffect,
   useCallback,
   useMemo,
 } from 'react';
 import MusicAPI from '../services/api';
+import { useAudioStore } from '../stores/audioStore';
 
 /* ───────────────────────────────────────────────
- F REQUENCIES & CONSTANTS                                     *
+ F REQUENCIES & CONSTANTS  *
  ─────────────────────────────────────────────── */
 const STANDARD_FREQUENCIES = [60, 230, 910, 3600, 14000];
 const ADVANCED_FREQUENCIES = [
   20, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800,
 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000,
 ];
+
+// ISO 226:2003 Equal-Loudness Contour at 80 phon (dB SPL)
+const ISO_226_2003_80_PHON = {
+  20: 113.1,
+  25: 103.2,
+  31.5: 95.7,
+  40: 89.1,
+  50: 83.3,
+  63: 77.8,
+  80: 72.7,
+  100: 68.0,
+  125: 63.8,
+  160: 59.8,
+  200: 56.4,
+  250: 53.3,
+  315: 50.5,
+  400: 47.9,
+  500: 45.8,
+  630: 44.0,
+  800: 42.4,
+  1000: 41.0,
+  1250: 40.0,
+  1600: 39.6,
+  2000: 39.6,
+  2500: 40.3,
+  3150: 41.5,
+  4000: 43.1,
+  5000: 45.3,
+  6300: 48.2,
+  8000: 51.8,
+  10000: 55.8,
+  12500: 60.2,
+  16000: 66.2,
+  20000: 73.2
+};
+
+// Calculate relative compensation needed (normalized to 1kHz)
+const EQUAL_LOUDNESS_COMPENSATION = {};
+const ref1kHz = ISO_226_2003_80_PHON[1000];
+Object.keys(ISO_226_2003_80_PHON).forEach(freq => {
+  // Positive values mean we need to boost, negative means cut
+  EQUAL_LOUDNESS_COMPENSATION[freq] = (ISO_226_2003_80_PHON[freq] - ref1kHz) * 0.3; // Scale factor for musical application
+});
 
 const FREQUENCY_BANDS = [
   { name: 'sub-bass', min: 20, max: 60, color: '#8B5CF6' },
@@ -42,6 +87,7 @@ const EQ_PRESETS = {
     { id: 'podcast', name: 'Podcast/Speech', values: [-2, 0, 2, 2, 0] },
     { id: 'night', name: 'Night Mode', values: [-1, -1, 0, -1, -2] },
     { id: 'clarity', name: 'Crystal Clear', values: [-1, 0, 1, 2, 2] },
+    { id: 'ultra-hearing', name: 'Ultra Hearing', values: [2, 1, 0, 1, 3] }, // Enhanced for hard-to-hear frequencies
   ],
   advanced: [
     { id: 'studio', name: 'Studio Reference', values: Array(30).fill(0) },
@@ -50,6 +96,12 @@ const EQ_PRESETS = {
     },
     { id: 'detailed', name: 'Detailed & Clean',
       values: [-1, -1, -1, -0.5, 0, 0, 0, 0.5, 1, 1, 1.5, 1.5, 2, 2, 2, 2, 1.5, 1, 1, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    { id: 'iso-compensation', name: 'ISO 226 Compensation',
+      values: ADVANCED_FREQUENCIES.map(freq => {
+        const compensation = EQUAL_LOUDNESS_COMPENSATION[freq] || 0;
+        return Math.round(compensation * 10) / 10;
+      })
     },
   ],
 };
@@ -61,7 +113,7 @@ const CACHE_CONFIG = {
 };
 
 const REALTIME_CONFIG = {
-  analysisInterval: 10,
+  analysisInterval: 120,
   sampleSize: 2048,
   smoothingFactor: 0.85,
   targetLoudness: -16,
@@ -71,8 +123,64 @@ const REALTIME_CONFIG = {
   frequencyResolution: 4096,
 };
 
+const isMediaSourceSupported = () => (
+  typeof window !== 'undefined' &&
+  window.MediaSource &&
+  typeof window.MediaSource.isTypeSupported === 'function'
+);
+
+const pickSupportedMimeType = (contentType, url = '') => {
+  if (!isMediaSourceSupported()) return null;
+
+  const normalizeAudioMime = (mime) => {
+    if (!mime) return '';
+    const base = mime.split(';')[0].trim().toLowerCase();
+    if (!base.startsWith('audio/')) return '';
+    if (base === 'audio/mp4' || base === 'audio/aac') return 'audio/mp4; codecs="mp4a.40.2"';
+    if (base === 'audio/ogg') return 'audio/ogg; codecs="opus"';
+    if (base === 'audio/webm') return 'audio/webm; codecs="vorbis"';
+    if (base === 'audio/mpeg' || base === 'audio/mp3') return 'audio/mpeg';
+    return base;
+  };
+
+  const guessFromUrl = (targetUrl) => {
+    const loweredUrl = targetUrl.toLowerCase();
+    if (loweredUrl.endsWith('.mp3') || loweredUrl.includes('format=mp3')) {
+      return 'audio/mpeg';
+    }
+    if (loweredUrl.endsWith('.m4a') || loweredUrl.endsWith('.mp4')) {
+      return 'audio/mp4; codecs="mp4a.40.2"';
+    }
+    if (loweredUrl.endsWith('.ogg')) {
+      return 'audio/ogg; codecs="opus"';
+    }
+    if (loweredUrl.endsWith('.webm')) {
+      return 'audio/webm; codecs="vorbis"';
+    }
+    return '';
+  };
+
+  const normalized = normalizeAudioMime(contentType);
+  const extGuess = guessFromUrl(url);
+
+  // Only stream when we can confidently map to the real mime type; guessing the wrong
+  // container (e.g., webm for an mp3 stream) can trigger decoder init failures.
+  const candidates = Array.from(new Set([normalized, extGuess].filter(Boolean)));
+
+  return candidates.find(type => window.MediaSource.isTypeSupported(type)) || null;
+};
+
+const toArrayBuffer = (chunk) => {
+  if (!chunk) return null;
+  if (chunk instanceof ArrayBuffer) return chunk;
+  if (chunk.buffer) {
+    return chunk.buffer.slice(chunk.byteOffset || 0, (chunk.byteOffset || 0) + chunk.byteLength);
+  }
+  return null;
+};
+
 /* ───────────────────────────────────────────────
- C ACHE MANAGER                                               *
+ C ACHE MANAGER            *
  ─────────────────────────────────────────────── */
 class CacheManager {
   constructor() {
@@ -193,9 +301,9 @@ class CacheManager {
 const cacheInstance = new CacheManager();
 
 /* ───────────────────────────────────────────────
- I NTELLIGENT AUDIO ANALYZER                                  *
+ U LTRA AUDIO ANALYZER WITH* ISO 226:2003
  ─────────────────────────────────────────────── */
-class IntelligentAudioAnalyzer {
+class UltraAudioAnalyzer {
   constructor(audioContext, analyzerNode) {
     this.audioContext = audioContext;
     this.analyzer = analyzerNode;
@@ -223,18 +331,6 @@ class IntelligentAudioAnalyzer {
     };
   }
 
-  safeDivide(a, b, defaultValue = 0) {
-    if (!isFinite(b) || b === 0) return defaultValue;
-    const result = a / b;
-    return isFinite(result) ? result : defaultValue;
-  }
-
-  safeLog10(value) {
-    if (value <= 0) return -100;
-    const result = Math.log10(value);
-    return isFinite(result) ? result : -100;
-  }
-
   analyzeContentType() {
     this.analyzer.getFloatFrequencyData(this.frequencyData);
     this.analyzer.getFloatTimeDomainData(this.timeData);
@@ -258,7 +354,7 @@ class IntelligentAudioAnalyzer {
       magnitudeSum += magnitude;
     }
 
-    const spectralCentroid = this.safeDivide(weightedSum, magnitudeSum, 1000);
+    const spectralCentroid = magnitudeSum > 0 ? weightedSum / magnitudeSum : 1000;
 
     if (zcr > 0.1 && spectralCentroid < 2000) {
       this.contentType = 'speech';
@@ -278,6 +374,7 @@ class IntelligentAudioAnalyzer {
     for (let i = 0; i < this.frequencyData.length; i++) {
       const freq = (i / this.frequencyData.length) * (this.audioContext.sampleRate / 2);
 
+      // A-weighting approximation
       let weight = 1;
       if (freq < 100) weight = 0.5;
       else if (freq < 1000) weight = 0.8 + (freq / 1000) * 0.2;
@@ -288,8 +385,8 @@ class IntelligentAudioAnalyzer {
       count += weight;
     }
 
-    const rms = Math.sqrt(this.safeDivide(sum, count));
-    return -0.691 + 10 * this.safeLog10(rms);
+    const rms = Math.sqrt(count > 0 ? sum / count : 0);
+    return -0.691 + 10 * Math.log10(Math.max(1e-10, rms));
   }
 
   analyzeSpectralBalance() {
@@ -314,12 +411,34 @@ class IntelligentAudioAnalyzer {
     }
 
     this.spectralBalance = {
-      bass: this.safeDivide(bands.bass, counts.bass),
-      mid: this.safeDivide(bands.mid, counts.mid),
-      treble: this.safeDivide(bands.treble, counts.treble),
+      bass: counts.bass > 0 ? bands.bass / counts.bass : 0,
+      mid: counts.mid > 0 ? bands.mid / counts.mid : 0,
+      treble: counts.treble > 0 ? bands.treble / counts.treble : 0,
     };
 
     return this.spectralBalance;
+  }
+
+  applyISO226Compensation(frequency) {
+    // Get the compensation value for the nearest frequency
+    const freqs = Object.keys(EQUAL_LOUDNESS_COMPENSATION).map(Number).sort((a, b) => a - b);
+    let compensation = 0;
+
+    for (let i = 0; i < freqs.length - 1; i++) {
+      if (frequency >= freqs[i] && frequency <= freqs[i + 1]) {
+        // Linear interpolation between two points
+        const f1 = freqs[i];
+        const f2 = freqs[i + 1];
+        const c1 = EQUAL_LOUDNESS_COMPENSATION[f1];
+        const c2 = EQUAL_LOUDNESS_COMPENSATION[f2];
+
+        const ratio = (frequency - f1) / (f2 - f1);
+        compensation = c1 + (c2 - c1) * ratio;
+        break;
+      }
+    }
+
+    return compensation;
   }
 
   generateAdaptiveEQ(frequencies, isAdvanced = false) {
@@ -337,23 +456,48 @@ class IntelligentAudioAnalyzer {
 
     const avgLoudness = this.history.loudness.reduce((a, b) => a + b, 0) / this.history.loudness.length;
 
-    this.updateAdaptiveParams(avgLoudness);
-
     const adjustments = frequencies.map((freq) => {
       let gain = 0;
 
-      const band = this.getFrequencyBand(freq);
-      if (!band) return 0;
+      // Apply ISO 226:2003 compensation
+      const isoCompensation = this.applyISO226Compensation(freq);
+      gain += isoCompensation * 0.5; // Scale down for musical use
 
+      // Content-specific adjustments
+      if (this.contentType === 'speech') {
+        if (freq < 80) gain -= 2;
+        if (freq >= 200 && freq <= 500) gain -= 1;
+        if (freq >= 2000 && freq <= 4000) gain += 1.5;
+      } else if (this.contentType === 'music') {
+        // Enhance typically hard-to-hear frequencies
+        if (freq <= 40) gain += 2; // Sub-bass enhancement
+        if (freq >= 10000) gain += 2.5; // High frequency enhancement
+      }
+
+      // Loudness-based adjustment
       const loudnessError = REALTIME_CONFIG.targetLoudness - avgLoudness;
-      const loudnessCorrection = this.calculateLoudnessCorrection(freq, loudnessError);
-      const balanceCorrection = this.calculateBalanceCorrection(freq, band);
-      const clarityBoost = this.calculateClarityEnhancement(freq);
-      const contentAdjustment = this.getContentSpecificAdjustment(freq);
+      if (Math.abs(loudnessError) > 2) {
+        if (freq >= 100 && freq <= 4000) {
+          gain += loudnessError * 0.2;
+        }
+      }
 
-      gain = loudnessCorrection + balanceCorrection + clarityBoost + contentAdjustment;
-      gain = this.applyFrequencyLimits(freq, gain, isAdvanced);
+      // Spectral balance correction
+      const balance = this.spectralBalance;
+      const avgLevel = (balance.bass + balance.mid + balance.treble) / 3;
 
+      if (freq < 250 && balance.bass > avgLevel * 1.5) {
+        gain -= 1;
+      } else if (freq >= 250 && freq < 4000 && balance.mid < avgLevel * 0.8) {
+        gain += 1;
+      } else if (freq >= 4000 && balance.treble < avgLevel * 0.7) {
+        gain += 1.5;
+      }
+
+      // Apply limits
+      gain = Math.max(REALTIME_CONFIG.maxCut, Math.min(REALTIME_CONFIG.maxBoost, gain));
+
+      // Smooth with history
       if (this.history.gains) {
         const index = frequencies.indexOf(freq);
         const previousGain = this.history.gains[index] || 0;
@@ -366,228 +510,10 @@ class IntelligentAudioAnalyzer {
     this.history.gains = adjustments;
     return adjustments;
   }
-
-  updateAdaptiveParams(avgLoudness) {
-    const rate = REALTIME_CONFIG.adaptiveSpeed;
-
-    if (this.contentType === 'speech') {
-      this.adaptiveParams.bassControl *= (1 - rate);
-      this.adaptiveParams.bassControl += 0.5 * rate;
-    } else if (this.spectralBalance.bass > this.spectralBalance.mid * 2) {
-      this.adaptiveParams.bassControl *= (1 - rate);
-      this.adaptiveParams.bassControl += 0.7 * rate;
-    } else {
-      this.adaptiveParams.bassControl *= (1 - rate);
-      this.adaptiveParams.bassControl += 1.0 * rate;
-    }
-
-    if (this.contentType === 'speech' || this.contentType === 'mixed') {
-      this.adaptiveParams.clarityEnhancement = Math.min(2, this.adaptiveParams.clarityEnhancement + rate);
-    } else {
-      this.adaptiveParams.clarityEnhancement = Math.max(0, this.adaptiveParams.clarityEnhancement - rate);
-    }
-  }
-
-  calculateLoudnessCorrection(freq, loudnessError) {
-    if (Math.abs(loudnessError) < 2) return 0;
-
-    let correction = 0;
-    if (freq < 100) {
-      correction = loudnessError * 0.1;
-    } else if (freq < 1000) {
-      correction = loudnessError * 0.3;
-    } else if (freq < 4000) {
-      correction = loudnessError * 0.4;
-    } else {
-      correction = loudnessError * 0.2;
-    }
-
-    return Math.max(-3, Math.min(3, correction));
-  }
-
-  calculateBalanceCorrection(freq, band) {
-    const balance = this.spectralBalance;
-    const avgLevel = (balance.bass + balance.mid + balance.treble) / 3;
-
-    let correction = 0;
-
-    if (band === 'bass' && balance.bass > avgLevel * 1.5) {
-      correction = -1 * this.adaptiveParams.bassControl;
-    } else if (band === 'mid' && balance.mid < avgLevel * 0.8) {
-      correction = 1 * this.adaptiveParams.midControl;
-    } else if (band === 'treble' && balance.treble < avgLevel * 0.7) {
-      correction = 0.5 * this.adaptiveParams.trebleControl;
-    }
-
-    return correction;
-  }
-
-  calculateClarityEnhancement(freq) {
-    if (this.adaptiveParams.clarityEnhancement === 0) return 0;
-
-    if (freq >= 1000 && freq <= 4000) {
-      return this.adaptiveParams.clarityEnhancement * 0.5;
-    } else if (freq >= 4000 && freq <= 8000) {
-      return this.adaptiveParams.clarityEnhancement * 0.3;
-    }
-
-    return 0;
-  }
-
-  getContentSpecificAdjustment(freq) {
-    switch (this.contentType) {
-      case 'speech':
-        if (freq < 80) return -2;
-        if (freq >= 200 && freq <= 500) return -1;
-        if (freq >= 2000 && freq <= 4000) return 1;
-        break;
-
-      case 'music':
-        if (freq >= 40 && freq <= 80) return 0.5;
-        if (freq >= 10000) return 0.5;
-        break;
-    }
-
-    return 0;
-  }
-
-  applyFrequencyLimits(freq, gain, isAdvanced) {
-    const limits = isAdvanced ?
-    { min: REALTIME_CONFIG.maxCut, max: REALTIME_CONFIG.maxBoost } :
-    { min: REALTIME_CONFIG.maxCut * 0.7, max: REALTIME_CONFIG.maxBoost * 0.7 };
-
-    if (freq < 40) {
-      return Math.max(limits.min * 0.5, Math.min(1, gain));
-    } else if (freq < 100) {
-      return Math.max(limits.min * 0.7, Math.min(2, gain));
-    } else if (freq > 10000) {
-      return Math.max(limits.min, Math.min(3, gain));
-    }
-
-    return Math.max(limits.min, Math.min(limits.max, gain));
-  }
-
-  getFrequencyBand(freq) {
-    if (freq < 250) return 'bass';
-    if (freq < 4000) return 'mid';
-    if (freq < 12000) return 'treble';
-    return 'ultra-high';
-  }
 }
 
 /* ───────────────────────────────────────────────
- S TATIC AUDIO ANALYZER                                       *
- ─────────────────────────────────────────────── */
-class AudioAnalyzer {
-  static async analyzeAudio(audioBlob, audioCtx) {
-    try {
-      const arrayBuffer = await audioBlob.arrayBuffer();
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-      const channelData = audioBuffer.getChannelData(0);
-      const sampleRate = audioBuffer.sampleRate;
-
-      const bands = this.analyzeBands(channelData, sampleRate);
-      const characteristics = this.detectCharacteristics(bands);
-      const waveform = this.generateWaveform(audioBuffer);
-
-      return {
-        bands,
-        characteristics,
-        duration: audioBuffer.duration,
-        sampleRate,
-        waveform,
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      console.error('Error analyzing audio:', error);
-      return null;
-    }
-  }
-
-  static analyzeBands(channelData, sampleRate) {
-    const bands = {};
-
-    FREQUENCY_BANDS.forEach(band => {
-      bands[band.name] = {
-        average: 0,
-        peak: 0,
-        energy: 0,
-      };
-    });
-
-    const blockSize = 2048;
-    const blocks = Math.floor(channelData.length / blockSize);
-
-    for (let i = 0; i < blocks; i++) {
-      const start = i * blockSize;
-      const block = channelData.slice(start, start + blockSize);
-
-      const energy = block.reduce((sum, sample) => sum + sample * sample, 0) / blockSize;
-
-      Object.values(bands).forEach(band => {
-        band.energy += energy / bands.length;
-      });
-    }
-
-    return bands;
-  }
-
-  static detectCharacteristics(bands) {
-    const totalEnergy = Object.values(bands).reduce((sum, band) => sum + band.energy, 0);
-
-    return {
-      balanced: true,
-      needsBassReduction: bands['sub-bass']?.energy > totalEnergy * 0.3,
-      needsClarityBoost: bands['mids']?.energy < totalEnergy * 0.2,
-      needsPresenceBoost: bands['presence']?.energy < totalEnergy * 0.1,
-    };
-  }
-
-  static generateWaveform(audioBuffer, samples = 1000) {
-    const channelData = audioBuffer.getChannelData(0);
-    const blockSize = Math.floor(channelData.length / samples);
-    const waveform = new Float32Array(samples);
-
-    for (let i = 0; i < samples; i++) {
-      const start = i * blockSize;
-      const end = Math.min(start + blockSize, channelData.length);
-
-      let sum = 0;
-      for (let j = start; j < end; j++) {
-        sum += Math.abs(channelData[j]);
-      }
-
-      waveform[i] = sum / (end - start);
-    }
-
-    return waveform;
-  }
-
-  static generateEQCurve(analysis, frequencies, isAdvanced = false) {
-    if (!analysis) return frequencies.map(() => 0);
-
-    const { characteristics } = analysis;
-    const curve = frequencies.map(freq => {
-      let adjustment = 0;
-
-      if (characteristics.needsBassReduction && freq < 100) {
-        adjustment = -2;
-      } else if (characteristics.needsClarityBoost && freq >= 1000 && freq <= 4000) {
-        adjustment = 1.5;
-      } else if (characteristics.needsPresenceBoost && freq >= 4000 && freq <= 8000) {
-        adjustment = 1;
-      }
-
-      return adjustment;
-    });
-
-    return curve;
-  }
-}
-
-/* ───────────────────────────────────────────────
- A UDIO NODE MANAGER - Single Context Management              *
+ A UDIO NODE MANAGER       *
  ─────────────────────────────────────────────── */
 class AudioNodeManager {
   constructor() {
@@ -597,6 +523,7 @@ class AudioNodeManager {
       gain: null,
       analyzer: null,
       compressor: null,
+      headroom: null,
       standardFilters: null,
       advancedFilters: null,
     };
@@ -605,30 +532,26 @@ class AudioNodeManager {
   }
 
   async initialize(volume = 1, eqGains = null, advancedEqGains = null) {
-    // Only create context once
-    if (!this.audioContext) {
+    let contextChanged = false;
+    if (!this.audioContext || this.audioContext.state === 'closed') {
       this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      contextChanged = true;
     }
 
-    // Resume if suspended
     if (this.audioContext.state === 'suspended') {
       await this.audioContext.resume();
     }
 
-    // Create nodes only if they don't exist
-    if (!this.nodes.gain) {
+    // If context changed, or if nodes don't exist, create them
+    if (contextChanged || !this.nodes.gain) {
       this.nodes.gain = this.audioContext.createGain();
-      this.nodes.gain.gain.value = volume;
-    }
-
-    if (!this.nodes.analyzer) {
       this.nodes.analyzer = this.audioContext.createAnalyser();
-      this.nodes.analyzer.fftSize = REALTIME_CONFIG.frequencyResolution;
-      this.nodes.analyzer.smoothingTimeConstant = 0.8;
-    }
-
-    if (!this.nodes.compressor) {
       this.nodes.compressor = this.audioContext.createDynamicsCompressor();
+      this.nodes.headroom = this.audioContext.createGain();
+      
+      // Reset source as it will be recreated for the specific audio element
+      this.nodes.source = null; 
+
       this.nodes.compressor.threshold.value = -12;
       this.nodes.compressor.knee.value = 20;
       this.nodes.compressor.ratio.value = 3;
@@ -636,42 +559,41 @@ class AudioNodeManager {
       this.nodes.compressor.release.value = 0.1;
     }
 
-    // Create filters only if they don't exist
-    if (!this.nodes.standardFilters) {
-      this.nodes.standardFilters = STANDARD_FREQUENCIES.map((freq, index) => {
-        const filter = this.audioContext.createBiquadFilter();
-        if (freq === 60) {
-          filter.type = 'highshelf';
-          filter.frequency.value = 80;
-        } else if (freq === 14000) {
-          filter.type = 'highshelf';
-          filter.frequency.value = 10000;
-        } else {
-          filter.type = 'peaking';
-          filter.frequency.value = freq;
-          filter.Q.value = 1.5;
-        }
-        filter.gain.value = eqGains?.[index] || 0;
-        return filter;
-      });
-    }
+    // Always update volume and headroom value
+    this.nodes.gain.gain.value = volume;
+    this.nodes.headroom.gain.value = 1;
 
-    if (!this.nodes.advancedFilters) {
-      this.nodes.advancedFilters = ADVANCED_FREQUENCIES.map((freq, index) => {
-        const filter = this.audioContext.createBiquadFilter();
+    // (Re)create filters, always from the current audioContext
+    this.nodes.standardFilters = STANDARD_FREQUENCIES.map((freq, index) => {
+      const filter = this.audioContext.createBiquadFilter();
+      if (freq === 60) {
+        filter.type = 'highshelf';
+        filter.frequency.value = 80;
+      } else if (freq === 14000) {
+        filter.type = 'highshelf';
+        filter.frequency.value = 10000;
+      } else {
         filter.type = 'peaking';
         filter.frequency.value = freq;
-        filter.Q.value = freq < 100 ? 0.7 : freq < 1000 ? 1.2 : 2.0;
-        filter.gain.value = advancedEqGains?.[index] || 0;
-        return filter;
-      });
-    }
+        filter.Q.value = 1.5;
+      }
+      filter.gain.value = eqGains?.[index] || 0;
+      return filter;
+    });
+
+    this.nodes.advancedFilters = ADVANCED_FREQUENCIES.map((freq, index) => {
+      const filter = this.audioContext.createBiquadFilter();
+      filter.type = 'peaking';
+      filter.frequency.value = freq;
+      filter.Q.value = freq < 100 ? 0.7 : freq < 1000 ? 1.2 : 2.0;
+      filter.gain.value = advancedEqGains?.[index] || 0;
+      return filter;
+    });
 
     return this.audioContext;
   }
 
   createSourceForElement(audioElement) {
-    // Only create source if it doesn't exist or is for a different element
     if (!this.nodes.source || this.nodes.source.mediaElement !== audioElement) {
       if (this.nodes.source) {
         this.disconnect();
@@ -689,10 +611,9 @@ class AudioNodeManager {
     const filters = mode === 'advanced' ? this.nodes.advancedFilters : this.nodes.standardFilters;
     this.currentMode = mode;
 
-    // Build connection chain
     let lastNode = this.nodes.source;
+    const headroomNode = this.nodes.headroom;
 
-    // Connect through filters
     if (filters && filters.length > 0) {
       filters.forEach(filter => {
         lastNode.connect(filter);
@@ -700,8 +621,13 @@ class AudioNodeManager {
       });
     }
 
-    // Connect through compressor and gain
-    lastNode.connect(this.nodes.compressor);
+    if (headroomNode) {
+      lastNode.connect(headroomNode);
+      headroomNode.connect(this.nodes.compressor);
+    } else {
+      lastNode.connect(this.nodes.compressor);
+    }
+
     this.nodes.compressor.connect(this.nodes.gain);
     this.nodes.gain.connect(this.nodes.analyzer);
     this.nodes.analyzer.connect(this.audioContext.destination);
@@ -713,7 +639,6 @@ class AudioNodeManager {
     if (!this.isConnected) return;
 
     try {
-      // Disconnect all nodes safely
       const disconnectNode = (node) => {
         if (node && node.numberOfOutputs > 0) {
           try {
@@ -727,6 +652,7 @@ class AudioNodeManager {
       disconnectNode(this.nodes.source);
       this.nodes.standardFilters?.forEach(disconnectNode);
       this.nodes.advancedFilters?.forEach(disconnectNode);
+      disconnectNode(this.nodes.headroom);
       disconnectNode(this.nodes.compressor);
       disconnectNode(this.nodes.gain);
       disconnectNode(this.nodes.analyzer);
@@ -750,6 +676,14 @@ class AudioNodeManager {
     }
   }
 
+  updateHeadroom(reductionDb = 0) {
+    if (!this.nodes.headroom || !this.audioContext) return;
+
+    const clampedReduction = Math.max(0, reductionDb);
+    const linearGain = Math.pow(10, -clampedReduction / 20);
+    this.nodes.headroom.gain.setTargetAtTime(linearGain, this.audioContext.currentTime, 0.05);
+  }
+
   getContext() {
     return this.audioContext;
   }
@@ -760,27 +694,45 @@ class AudioNodeManager {
 }
 
 /* ───────────────────────────────────────────────
- M AIN AUDIO CONTEXT                                          *
+ M AIN AUDIO CONTEXT       *
  ─────────────────────────────────────────────── */
 const AudioContextData = createContext(null);
+const NowPlayingContext = createContext(null);
+const PlaybackContext = createContext(null);
+const QueueContext = createContext(null);
 
 export const AudioProvider = ({ children }) => {
-  // Single instance of node manager
   const nodeManagerRef = useRef(null);
   const audioRef = useRef(null);
-  const intelligentAnalyzerRef = useRef(null);
+  const ultraAnalyzerRef = useRef(null);
   const analysisIntervalRef = useRef(null);
-  const visualizerIntervalRef = useRef(null);
   const currentBlobUrlRef = useRef(null);
+  const currentStreamControllerRef = useRef(null);
+  const currentStreamFinalizeRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const micSourceRef = useRef(null);
+  const micAnalyzerRef = useRef(null);
+  const ambientHistoryRef = useRef(null);
+  const micFrameCountRef = useRef(0);
+  const micFreqBufferRef = useRef(null);
+  const micLevelRef = useRef(0);
+  const committedMicLevelRef = useRef(0);
+  const lastMicLevelCommitRef = useRef(0);
+  const lastRealtimeAdjustmentsRef = useRef({
+    standard: null,
+    advanced: null,
+  });
+  const lastTargetUpdateRef = useRef({
+    standard: 0,
+    advanced: 0,
+  });
 
-  // Initialize node manager once
   useEffect(() => {
     if (!nodeManagerRef.current) {
       nodeManagerRef.current = new AudioNodeManager();
     }
   }, []);
 
-  // Initialize audio element
   useEffect(() => {
     const audio = new Audio();
     audio.preload = 'auto';
@@ -795,224 +747,497 @@ export const AudioProvider = ({ children }) => {
     };
   }, []);
 
-  // EQ state
-  const [eqMode, setEqMode] = useState(() =>
-  localStorage.getItem('eq-mode') || 'standard'
-  );
+  // ─────────────────────────────────────────────────
+  // ZUSTAND STORE ACCESS (replaces useState for performance)
+  // Components use selectors to subscribe only to needed state
+  // ─────────────────────────────────────────────────
 
-  const [eqGains, setEqGains] = useState(() => {
-    try {
-      const saved = localStorage.getItem('eq-gains');
-      return saved ? JSON.parse(saved) : STANDARD_FREQUENCIES.map(() => 0);
-    } catch {
-      return STANDARD_FREQUENCIES.map(() => 0);
+  // Get store actions (stable references)
+  const store = useAudioStore;
+  const getState = store.getState;
+
+  // Refs for non-reactive values and performance optimization
+  const persistTimeoutRef = useRef({ standard: null, advanced: null });
+  const prevBassToneRef = useRef(getState().bassTone);
+  const currentTimeRef = useRef(0);
+  const lastCurrentTimeCommitRef = useRef(0);
+  const queueRef = useRef([]);
+  const queueHistoryRef = useRef([]);
+  const queueIndexRef = useRef(0);
+
+  // Debounced localStorage persistence
+  const schedulePersist = useCallback((storageKey, value, modeKey) => {
+    if (persistTimeoutRef.current[modeKey]) {
+      clearTimeout(persistTimeoutRef.current[modeKey]);
     }
-  });
+    persistTimeoutRef.current[modeKey] = setTimeout(() => {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(value));
+      } finally {
+        persistTimeoutRef.current[modeKey] = null;
+      }
+    }, 450);
+  }, []);
 
-  const [advancedEqGains, setAdvancedEqGains] = useState(() => {
-    try {
-      const saved = localStorage.getItem('advanced-eq-gains');
-      return saved ? JSON.parse(saved) : ADVANCED_FREQUENCIES.map(() => 0);
-    } catch {
-      return ADVANCED_FREQUENCIES.map(() => 0);
-    }
-  });
+  // Sync refs with store (using subscribe for efficiency)
+  useEffect(() => {
+    const unsubQueue = store.subscribe(
+      (state) => state.queue,
+      (queue) => { queueRef.current = queue; }
+    );
+    const unsubHistory = store.subscribe(
+      (state) => state.queueHistory,
+      (history) => { queueHistoryRef.current = history; }
+    );
+    const unsubIndex = store.subscribe(
+      (state) => state.queueIndex,
+      (index) => { queueIndexRef.current = index; }
+    );
 
-  // EQSmart state
-  const [eqSmartEnabled, setEqSmartEnabled] = useState(() =>
-  localStorage.getItem('eq-smart-enabled') === 'true'
-  );
-  const [eqSmartProcessing, setEqSmartProcessing] = useState(false);
-  const [eqSmartSuggestions, setEqSmartSuggestions] = useState({
-    standard: STANDARD_FREQUENCIES.map(() => 0),
-                                                               advanced: ADVANCED_FREQUENCIES.map(() => 0),
-  });
-  const [dynamicEqEnabled, setDynamicEqEnabled] = useState(() =>
-  localStorage.getItem('dynamic-eq-enabled') === 'true'
-  );
-  const [realtimeAnalysisData, setRealtimeAnalysisData] = useState(null);
+    // Initialize refs
+    queueRef.current = getState().queue;
+    queueHistoryRef.current = getState().queueHistory;
+    queueIndexRef.current = getState().queueIndex;
 
-  // UI state
-  const [targetEqGains, setTargetEqGains] = useState([...eqGains]);
-  const [targetAdvancedEqGains, setTargetAdvancedEqGains] = useState([...advancedEqGains]);
-  const [isDraggingEQ, setIsDraggingEQ] = useState(false);
+    return () => {
+      unsubQueue();
+      unsubHistory();
+      unsubIndex();
+    };
+  }, []);
 
-  // Playback state
-  const [currentTrack, setCurrentTrack] = useState(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [volume, setVolume] = useState(() =>
-  parseFloat(localStorage.getItem('volume')) || 1
-  );
-  const [buffering, setBuffering] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  // Sync dynamic EQ with smart EQ
+  useEffect(() => {
+    const unsub = store.subscribe(
+      (state) => ({ smart: state.eqSmartEnabled, dynamic: state.dynamicEqEnabled }),
+      ({ smart, dynamic }) => {
+        if (smart && !dynamic) {
+          getState().setDynamicEqEnabled(true);
+        }
+      }
+    );
+    return unsub;
+  }, []);
 
-  // Queue state
-  const [queue, setQueue] = useState([]);
-  const [queueIndex, setQueueIndex] = useState(0);
-  const [queueHistory, setQueueHistory] = useState([]);
-  const [shuffle, setShuffle] = useState(() =>
-  localStorage.getItem('shuffle') === 'true'
-  );
-  const [repeat, setRepeat] = useState(() =>
-  localStorage.getItem('repeat') || 'none'
-  );
-
-  // Network state
-  const [networkStatus, setNetworkStatus] = useState(navigator.onLine);
-  const [offlineMode, setOfflineMode] = useState(false);
+  // Toggle functions using store
+  const toggleShuffle = useCallback(() => getState().toggleShuffle(), []);
+  const toggleRepeat = useCallback(() => getState().toggleRepeat(), []);
 
   // Visualizer state
-  const [visualizerData, setVisualizerData] = useState(null);
-
   /* ───────────────────────────────────────────────
-   C ore Audio Functions                                      *
+   C ore Audio Functions   *
    ─────────────────────────────────────────────── */
 
   const initializeAudio = useCallback(async () => {
     if (!nodeManagerRef.current) return null;
 
+    const { volume, eqGains, advancedEqGains } = getState();
     const ctx = await nodeManagerRef.current.initialize(volume, eqGains, advancedEqGains);
 
-    // Create intelligent analyzer if needed
-    if (!intelligentAnalyzerRef.current && nodeManagerRef.current.getAnalyzer()) {
-      intelligentAnalyzerRef.current = new IntelligentAudioAnalyzer(
+    if (!ultraAnalyzerRef.current && nodeManagerRef.current.getAnalyzer()) {
+      ultraAnalyzerRef.current = new UltraAudioAnalyzer(
         ctx,
         nodeManagerRef.current.getAnalyzer()
       );
     }
 
     return ctx;
-  }, [volume, eqGains, advancedEqGains]);
+  }, []);
 
   const connectAudioNodes = useCallback(() => {
     if (!nodeManagerRef.current || !audioRef.current.src) return;
+    nodeManagerRef.current.connect(getState().eqMode);
+  }, []);
 
-    nodeManagerRef.current.connect(eqMode);
-  }, [eqMode]);
+  const ensureAudioReady = useCallback(async () => {
+    const ctx = nodeManagerRef.current?.getContext();
+
+    if (nodeManagerRef.current && audioRef.current) {
+      nodeManagerRef.current.createSourceForElement(audioRef.current);
+      if (!nodeManagerRef.current.isConnected && audioRef.current.src) {
+        nodeManagerRef.current.connect(getState().eqMode);
+      }
+    }
+
+    if (ctx && ctx.state !== 'running') {
+      try {
+        await ctx.resume();
+      } catch (error) {
+        console.error('Failed to resume audio context:', error);
+      }
+    }
+  }, []);
+
+  const stopActiveStream = useCallback(() => {
+    if (currentStreamControllerRef.current) {
+      try {
+        currentStreamControllerRef.current.abort();
+      } catch (err) {
+        console.error('Error aborting active stream:', err);
+      }
+      currentStreamControllerRef.current = null;
+    }
+    currentStreamFinalizeRef.current = null;
+  }, []);
 
   /* ───────────────────────────────────────────────
-   E Q Control Functions                                      *
+   E Q Control Functions   *
    ─────────────────────────────────────────────── */
 
-  const applyRealtimeEQ = useCallback((adjustments) => {
+  const applyHeadroomCompensation = useCallback((gains) => {
+    if (!nodeManagerRef.current) return;
+
+    if (!Array.isArray(gains) || gains.length === 0) {
+      nodeManagerRef.current.updateHeadroom(0);
+      return;
+    }
+
+    const numericGains = gains.map((value) => (
+      typeof value === 'number' && isFinite(value) ? value : 0
+    ));
+
+    const maxBoost = Math.max(0, ...numericGains);
+    const positiveSum = numericGains.reduce((sum, gain) => sum + Math.max(gain, 0), 0);
+    const avgPositive = positiveSum / numericGains.length;
+    const rmsPositive = Math.sqrt(
+      numericGains.reduce((sum, gain) => sum + Math.max(gain, 0) * Math.max(gain, 0), 0) /
+      Math.max(1, numericGains.length)
+    );
+
+    const { eqSmartEnabled, eqSmartSettings } = getState();
+    const baseHeadroom = eqSmartEnabled ? Math.max(0, eqSmartSettings.headroom ?? 6) : 0;
+
+    // Aim for enough reduction to cover summed boosts and overlap between bands.
+    const computedReduction = Math.max(
+      maxBoost,
+      avgPositive * 1.5,
+      rmsPositive * 1.25,
+      positiveSum / Math.max(1, numericGains.length / 2)
+    );
+
+    const targetReduction = Math.min(18, baseHeadroom + computedReduction);
+    nodeManagerRef.current.updateHeadroom(targetReduction);
+  }, []);
+
+  const applyRealtimeEQ = useCallback((adjustments, options = {}) => {
+    const { eqMode, isDraggingEQ } = getState();
     if (!nodeManagerRef.current || isDraggingEQ) return;
 
+    const { updateState = false } = options;
     const validAdjustments = adjustments.map((adj) => {
       if (typeof adj !== 'number' || !isFinite(adj)) return 0;
       return Math.max(-12, Math.min(12, adj));
     });
 
+    const lastAdjustments = lastRealtimeAdjustmentsRef.current[eqMode];
+    const hasMeaningfulChange = !lastAdjustments ||
+      lastAdjustments.length !== validAdjustments.length ||
+      lastAdjustments.some((prev, index) => Math.abs(prev - validAdjustments[index]) > 0.01);
+
+    if (!hasMeaningfulChange) return;
+    lastRealtimeAdjustmentsRef.current[eqMode] = [...validAdjustments];
+
     validAdjustments.forEach((adjustment, index) => {
       nodeManagerRef.current.updateFilterGain(eqMode, index, adjustment);
     });
 
+    const modeKey = eqMode === 'advanced' ? 'advanced' : 'standard';
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const shouldUpdateTargets = updateState || now - (lastTargetUpdateRef.current[modeKey] || 0) > 180;
+
     if (eqMode === 'advanced') {
-      setAdvancedEqGains(validAdjustments);
-      setTargetAdvancedEqGains(validAdjustments);
+      if (shouldUpdateTargets) {
+        getState().setTargetAdvancedEqGains(validAdjustments);
+        lastTargetUpdateRef.current.advanced = now;
+      }
+      if (updateState) {
+        getState().setAdvancedEqGains(validAdjustments);
+      }
     } else {
-      setEqGains(validAdjustments);
-      setTargetEqGains(validAdjustments);
+      if (shouldUpdateTargets) {
+        getState().setTargetEqGains(validAdjustments);
+        lastTargetUpdateRef.current.standard = now;
+      }
+      if (updateState) {
+        getState().setEqGains(validAdjustments);
+      }
     }
-  }, [eqMode, isDraggingEQ]);
+    applyHeadroomCompensation(validAdjustments);
+  }, [applyHeadroomCompensation]);
+
+  const tuneEqSmartAdjustments = useCallback((adjustments, freqs) => {
+    if (!Array.isArray(adjustments) || !Array.isArray(freqs)) return [];
+
+    const { eqSmartSettings } = getState();
+    return adjustments.map((gain, index) => {
+      const freq = freqs[index] || 0;
+      let tuned = gain * (eqSmartSettings.intensity ?? 1);
+
+      if (eqSmartSettings.bassTilt) {
+        const weight = freq <= 120 ? 1 : freq <= 250 ? 0.6 : freq <= 400 ? 0.35 : 0;
+        tuned += (eqSmartSettings.bassTilt || 0) * weight;
+      }
+
+      if (eqSmartSettings.trebleTilt) {
+        const weight = freq >= 8000 ? 1 : freq >= 4000 ? 0.6 : freq >= 2500 ? 0.35 : 0;
+        tuned += (eqSmartSettings.trebleTilt || 0) * weight;
+      }
+
+      return Math.max(REALTIME_CONFIG.maxCut, Math.min(REALTIME_CONFIG.maxBoost, tuned));
+    });
+  }, []);
+
+  const normalizeAdjustments = useCallback((adjustments) => {
+    if (!Array.isArray(adjustments) || adjustments.length === 0) return [];
+
+    const numeric = adjustments.map(a => (typeof a === 'number' && isFinite(a) ? a : 0));
+    const mean = numeric.reduce((sum, g) => sum + g, 0) / numeric.length;
+    let centered = numeric.map(g => g - mean);
+
+    const positive = centered.reduce((sum, g) => sum + Math.max(0, g), 0);
+    const negative = centered.reduce((sum, g) => sum + Math.abs(Math.min(0, g)), 0);
+
+    if (positive > negative * 1.2 && positive > 0) {
+      const scale = (negative * 1.05) / positive;
+      centered = centered.map(g => (g > 0 ? g * scale : g));
+    } else if (negative > positive * 1.2 && negative > 0) {
+      const scale = (positive * 1.05) / negative;
+      centered = centered.map(g => (g < 0 ? g * scale : g));
+    }
+
+    return centered.map(g => Math.max(REALTIME_CONFIG.maxCut, Math.min(REALTIME_CONFIG.maxBoost, g)));
+  }, []);
+
+  const stopMicrophoneCapture = useCallback(() => {
+    try {
+      micSourceRef.current?.disconnect();
+    } catch {
+      // Ignore disconnect issues
+    }
+
+    micSourceRef.current = null;
+    micAnalyzerRef.current = null;
+
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => {
+        try {
+          track.stop();
+        } catch {
+          // Ignore failures
+        }
+      });
+      micStreamRef.current = null;
+    }
+
+    ambientHistoryRef.current = null;
+    getState().setMicLevel(0);
+    const currentStatus = getState().micStatus;
+    if (currentStatus === 'active' || currentStatus === 'prompt') {
+      getState().setMicStatus('idle');
+    }
+  }, []);
+
+  const requestMicrophoneAccess = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      getState().setMicStatus('unavailable');
+      return null;
+    }
+
+    const { micStatus } = getState();
+    if (micStatus === 'active' && micStreamRef.current && micAnalyzerRef.current) {
+      return micAnalyzerRef.current;
+    }
+
+    try {
+      if (getState().micStatus !== 'active') {
+        getState().setMicStatus('prompt');
+      }
+      await initializeAudio();
+      const ctx = nodeManagerRef.current?.getContext();
+      if (!ctx) {
+        throw new Error('Audio context not ready');
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+
+      stopMicrophoneCapture();
+
+      micStreamRef.current = stream;
+      micSourceRef.current = ctx.createMediaStreamSource(stream);
+      micAnalyzerRef.current = ctx.createAnalyser();
+      micAnalyzerRef.current.fftSize = 2048;
+      micAnalyzerRef.current.smoothingTimeConstant = 0.7;
+
+      micSourceRef.current.connect(micAnalyzerRef.current);
+
+      getState().setMicStatus('active');
+      return true;
+    } catch (error) {
+      console.error('Microphone access failed:', error);
+      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+      const unavailable = error?.name === 'NotFoundError';
+      getState().setMicStatus(denied ? 'denied' : unavailable ? 'unavailable' : 'error');
+      return false;
+    }
+  }, [initializeAudio, stopMicrophoneCapture]);
+
+  const calculateAmbientCompensation = useCallback((frequencies) => {
+    if (!micAnalyzerRef.current || getState().micStatus !== 'active') return null;
+
+    const analyzer = micAnalyzerRef.current;
+    const freqData = new Float32Array(analyzer.frequencyBinCount);
+    analyzer.getFloatFrequencyData(freqData);
+    const nyquist = (analyzer.context?.sampleRate || 48000) / 2;
+
+    const adjustments = frequencies.map((freq) => {
+      const targetIndex = Math.floor((freq / nyquist) * freqData.length);
+      const window = Math.max(1, Math.floor(freqData.length / 96));
+      let sum = 0;
+      let count = 0;
+
+      for (let i = targetIndex - window; i <= targetIndex + window; i++) {
+        if (i >= 0 && i < freqData.length) {
+          sum += freqData[i];
+          count++;
+        }
+      }
+
+      const avgDb = count > 0 ? sum / count : -110;
+      const clamped = Math.min(-15, Math.max(-110, avgDb));
+      const normalized = (clamped + 110) / 95; // 0 when quiet, 1 when loud
+      const bias = (normalized - 0.5) * 2; // -1..1
+      const gain = bias * 1.8; // Gentle +/- compensation
+      return gain;
+    });
+
+    const smoothed = adjustments.map((gain, index) => {
+      const previous = ambientHistoryRef.current?.[index] ?? gain;
+      const mixed = previous * 0.65 + gain * 0.35;
+      return Math.round(mixed * 10) / 10;
+    });
+
+    ambientHistoryRef.current = smoothed;
+    return smoothed;
+  }, []);
 
   const startIntelligentAnalysis = useCallback(() => {
-    if (!intelligentAnalyzerRef.current || !eqSmartEnabled || !dynamicEqEnabled) return;
+    const { eqSmartEnabled, dynamicEqEnabled, eqSmartProcessing } = getState();
+    if (!ultraAnalyzerRef.current || !eqSmartEnabled || !dynamicEqEnabled) return;
 
     if (analysisIntervalRef.current) {
       clearInterval(analysisIntervalRef.current);
     }
 
+    // Only set if not already true to avoid triggering subscriptions
+    if (!eqSmartProcessing) {
+      getState().setEqSmartProcessing(true);
+    }
+
     analysisIntervalRef.current = setInterval(() => {
+      const { isDraggingEQ, isPlaying, eqMode, eqSmartSettings } = getState();
       if (!isDraggingEQ && isPlaying) {
         const frequencies = eqMode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES;
-        const adjustments = intelligentAnalyzerRef.current.generateAdaptiveEQ(
+        const adjustments = ultraAnalyzerRef.current.generateAdaptiveEQ(
           frequencies,
           eqMode === 'advanced'
         );
 
-        applyRealtimeEQ(adjustments);
+        const tunedAdjustments = tuneEqSmartAdjustments(adjustments, frequencies);
 
-        setRealtimeAnalysisData({
-          adjustments,
-          contentType: intelligentAnalyzerRef.current.contentType,
-          spectralBalance: intelligentAnalyzerRef.current.spectralBalance,
-          timestamp: Date.now(),
-        });
+        const ambientAdjustments = calculateAmbientCompensation(frequencies);
+        const combinedAdjustments = ambientAdjustments
+          ? tunedAdjustments.map((gain, index) => {
+              const micBlend = Math.max(0, Math.min(1, eqSmartSettings.micBlend ?? 0.7));
+              const ambient = ambientAdjustments[index] * micBlend * (0.6 + micLevelRef.current * 0.8);
+              const combined = gain + ambient;
+              return Math.max(REALTIME_CONFIG.maxCut, Math.min(REALTIME_CONFIG.maxBoost, combined));
+            })
+          : tunedAdjustments;
+
+        const normalizedAdjustments = normalizeAdjustments(combinedAdjustments);
+        applyRealtimeEQ(normalizedAdjustments, { updateState: false });
       }
     }, REALTIME_CONFIG.analysisInterval);
-  }, [eqSmartEnabled, dynamicEqEnabled, eqMode, isDraggingEQ, isPlaying, applyRealtimeEQ]);
+  }, [applyRealtimeEQ, calculateAmbientCompensation, tuneEqSmartAdjustments, normalizeAdjustments]);
 
   const stopIntelligentAnalysis = useCallback(() => {
     if (analysisIntervalRef.current) {
       clearInterval(analysisIntervalRef.current);
       analysisIntervalRef.current = null;
     }
+    lastRealtimeAdjustmentsRef.current.standard = null;
+    lastRealtimeAdjustmentsRef.current.advanced = null;
+    // Only set if currently true to avoid triggering subscriptions
+    if (getState().eqSmartProcessing) {
+      getState().setEqSmartProcessing(false);
+    }
   }, []);
 
   const setEqGain = useCallback((index, value) => {
     const clampedValue = Math.max(-12, Math.min(12, value));
 
-    if (eqMode === 'standard') {
-      setEqGains((prev) => {
-        const newGains = [...prev];
-        newGains[index] = clampedValue;
-        return newGains;
-      });
-
+    if (getState().eqMode === 'standard') {
+      const currentGains = [...getState().eqGains];
+      currentGains[index] = clampedValue;
+      getState().setEqGains(currentGains);
+      applyHeadroomCompensation(currentGains);
       nodeManagerRef.current?.updateFilterGain('standard', index, clampedValue);
     }
-  }, [eqMode]);
+  }, [applyHeadroomCompensation]);
 
   const setAdvancedEqGain = useCallback((index, value) => {
     const clampedValue = Math.max(-12, Math.min(12, value));
 
-    if (eqMode === 'advanced') {
-      setAdvancedEqGains((prev) => {
-        const newGains = [...prev];
-        newGains[index] = clampedValue;
-        return newGains;
-      });
-
+    if (getState().eqMode === 'advanced') {
+      const currentGains = [...getState().advancedEqGains];
+      currentGains[index] = clampedValue;
+      getState().setAdvancedEqGains(currentGains);
+      applyHeadroomCompensation(currentGains);
       nodeManagerRef.current?.updateFilterGain('advanced', index, clampedValue);
     }
-  }, [eqMode]);
+  }, [applyHeadroomCompensation]);
 
   const resetEq = useCallback((mode = null) => {
-    const targetMode = mode || eqMode;
+    const targetMode = mode || getState().eqMode;
 
     stopIntelligentAnalysis();
 
     if (targetMode === 'advanced') {
       const zeros = ADVANCED_FREQUENCIES.map(() => 0);
-      setAdvancedEqGains(zeros);
-      setTargetAdvancedEqGains(zeros);
+      getState().setAdvancedEqGains(zeros);
+      getState().setTargetAdvancedEqGains(zeros);
 
       zeros.forEach((_, index) => {
         nodeManagerRef.current?.updateFilterGain('advanced', index, 0);
       });
     } else {
       const zeros = STANDARD_FREQUENCIES.map(() => 0);
-      setEqGains(zeros);
-      setTargetEqGains(zeros);
+      getState().setEqGains(zeros);
+      getState().setTargetEqGains(zeros);
 
       zeros.forEach((_, index) => {
         nodeManagerRef.current?.updateFilterGain('standard', index, 0);
       });
     }
 
+    const { eqSmartEnabled, dynamicEqEnabled, isPlaying } = getState();
     if (eqSmartEnabled && dynamicEqEnabled && isPlaying) {
       setTimeout(startIntelligentAnalysis, 100);
     }
-  }, [eqMode, stopIntelligentAnalysis, startIntelligentAnalysis, eqSmartEnabled, dynamicEqEnabled, isPlaying]);
+  }, [stopIntelligentAnalysis, startIntelligentAnalysis]);
 
   const applyEqPreset = useCallback((preset) => {
     if (!preset?.values) return;
 
     stopIntelligentAnalysis();
 
+    const { eqMode } = getState();
     if (eqMode === 'advanced' && preset.values.length === ADVANCED_FREQUENCIES.length) {
       preset.values.forEach((value, index) => {
         setAdvancedEqGain(index, value);
@@ -1023,154 +1248,56 @@ export const AudioProvider = ({ children }) => {
       });
     }
 
+    const { eqSmartEnabled, dynamicEqEnabled, isPlaying } = getState();
     if (eqSmartEnabled && dynamicEqEnabled && isPlaying) {
       setTimeout(startIntelligentAnalysis, 100);
     }
-  }, [eqMode, setEqGain, setAdvancedEqGain, stopIntelligentAnalysis, startIntelligentAnalysis, eqSmartEnabled, dynamicEqEnabled, isPlaying]);
+  }, [setEqGain, setAdvancedEqGain, stopIntelligentAnalysis, startIntelligentAnalysis]);
 
   /* ───────────────────────────────────────────────
-   T rack Analysis                                            *
-   ─────────────────────────────────────────────── */
-
-  const analyzeCurrentTrack = useCallback(async (trackId) => {
-    if (!trackId) return null;
-
-    try {
-      const cached = await cacheInstance.get('audio-analysis', trackId);
-      if (cached && !cacheInstance.isStale(cached.timestamp, CACHE_CONFIG.longTerm)) {
-        return cached;
-      }
-
-      const audioFile = await cacheInstance.get('audio-files', trackId);
-      if (!audioFile?.blob) {
-        console.log('No cached audio for analysis');
-        return null;
-      }
-
-      await initializeAudio();
-      const ctx = nodeManagerRef.current?.getContext();
-      if (!ctx) return null;
-
-      const analysis = await AudioAnalyzer.analyzeAudio(audioFile.blob, ctx);
-
-      if (analysis) {
-        await cacheInstance.put('audio-analysis', { trackId, ...analysis });
-      }
-
-      return analysis;
-    } catch (error) {
-      console.error('Error analyzing track:', error);
-      return null;
-    }
-  }, [initializeAudio]);
-
-  const applyEqSmartSettings = useCallback(async (trackId) => {
-    if (!trackId || !eqSmartEnabled) return false;
-
-    try {
-      setEqSmartProcessing(true);
-
-      const analysis = await analyzeCurrentTrack(trackId);
-      if (!analysis) {
-        setEqSmartProcessing(false);
-        return false;
-      }
-
-      const standardCurve = AudioAnalyzer.generateEQCurve(
-        analysis,
-        STANDARD_FREQUENCIES,
-        false
-      );
-      const advancedCurve = AudioAnalyzer.generateEQCurve(
-        analysis,
-        ADVANCED_FREQUENCIES,
-        true
-      );
-
-      setEqSmartSuggestions({
-        standard: standardCurve,
-        advanced: advancedCurve,
-      });
-
-      if (eqSmartEnabled && !dynamicEqEnabled) {
-        if (eqMode === 'advanced') {
-          advancedCurve.forEach((value, index) => {
-            setAdvancedEqGain(index, value);
-          });
-        } else {
-          standardCurve.forEach((value, index) => {
-            setEqGain(index, value);
-          });
-        }
-      }
-
-      setEqSmartProcessing(false);
-
-      if (dynamicEqEnabled && isPlaying) {
-        startIntelligentAnalysis();
-      }
-
-      return true;
-    } catch (error) {
-      console.error('Error applying EQSmart:', error);
-      setEqSmartProcessing(false);
-      return false;
-    }
-  }, [
-    eqSmartEnabled,
-    dynamicEqEnabled,
-    analyzeCurrentTrack,
-    eqMode,
-    isPlaying,
-    setEqGain,
-    setAdvancedEqGain,
-    startIntelligentAnalysis
-  ]);
-
-  /* ───────────────────────────────────────────────
-   P layback Functions                                        *
+   P layback Functions     *
    ─────────────────────────────────────────────── */
 
   const playTrack = useCallback(async (track, addToQueueFlag = true) => {
     if (!track?.id) {
-      setError('Invalid track data');
+      getState().setError('Invalid track data');
       return;
     }
 
     try {
-      setError(null);
-      setLoading(true);
+      getState().setError(null);
+      getState().setLoading(true);
 
       stopIntelligentAnalysis();
+      stopActiveStream();
 
+      const { offlineMode, networkStatus } = getState();
       const token = localStorage.getItem('token');
       if (!token && !offlineMode && networkStatus) {
-        setError('Authentication required. Please log in.');
-        setLoading(false);
+        getState().setError('Authentication required. Please log in.');
+        getState().setLoading(false);
         return;
       }
 
-      // Initialize audio context
       await initializeAudio();
 
-      // Toggle play/pause for same track
+      const { currentTrack, isPlaying, eqSmartEnabled, dynamicEqEnabled } = getState();
       if (currentTrack?.id === track.id && audioRef.current.src && nodeManagerRef.current?.isConnected) {
         if (isPlaying) {
           audioRef.current.pause();
-          setIsPlaying(false);
+          getState().setIsPlaying(false);
           stopIntelligentAnalysis();
         } else {
           await audioRef.current.play();
-          setIsPlaying(true);
+          getState().setIsPlaying(true);
           if (eqSmartEnabled && dynamicEqEnabled) {
             startIntelligentAnalysis();
           }
         }
-        setLoading(false);
+        getState().setLoading(false);
         return;
       }
 
-      // Clean up previous audio
       if (currentBlobUrlRef.current) {
         URL.revokeObjectURL(currentBlobUrlRef.current);
         currentBlobUrlRef.current = null;
@@ -1181,7 +1308,6 @@ export const AudioProvider = ({ children }) => {
         audioRef.current.src = '';
       }
 
-      // Get track info
       let trackInfo = track;
       const cachedTrack = await cacheInstance.get('tracks', track.id);
 
@@ -1203,9 +1329,9 @@ export const AudioProvider = ({ children }) => {
         throw new Error('Track not available offline');
       }
 
-      // Load audio
       const audio = audioRef.current;
       let audioUrl;
+      let cachePromise = null;
 
       const cachedAudio = await cacheInstance.get('audio-files', trackInfo.id);
 
@@ -1220,22 +1346,189 @@ export const AudioProvider = ({ children }) => {
             throw new Error('No stream URL provided');
           }
 
-          // Fetch with auth headers
+          const supportsMediaSource = isMediaSourceSupported();
+          const controller = supportsMediaSource ? new AbortController() : null;
+
           const response = await fetch(streamInfo.url, {
-            headers: streamInfo.headers
+            headers: streamInfo.headers,
+            signal: controller?.signal,
           });
 
           if (!response.ok) {
             throw new Error(`Failed to load audio: ${response.status} ${response.statusText}`);
           }
 
-          const blob = await response.blob();
-          audioUrl = URL.createObjectURL(blob);
-          currentBlobUrlRef.current = audioUrl;
+          const contentTypeHeader = response.headers.get('content-type');
+          const mimeType = contentTypeHeader?.split(';')?.[0]?.trim() || '';
+          const fallbackMimeType = mimeType || 'audio/mpeg';
+          const supportedMime = pickSupportedMimeType(contentTypeHeader || mimeType, streamInfo.url);
+          const canStream = supportsMediaSource &&
+            response.body &&
+            supportedMime;
 
-          // Cache the blob
-          cacheInstance.put('audio-files', { id: trackInfo.id, blob })
-          .catch(err => console.error('Cache error:', err));
+          if (canStream) {
+            const mediaSource = new MediaSource();
+            const reader = response.body.getReader();
+            const chunks = [];
+            audioUrl = URL.createObjectURL(mediaSource);
+            currentBlobUrlRef.current = audioUrl;
+            currentStreamControllerRef.current = controller;
+            let streamErrored = false;
+            let switchedToFallback = false;
+
+            const switchToBufferedBlob = async () => {
+              if (switchedToFallback) return;
+              switchedToFallback = true;
+              try {
+                const blob = chunks.length ? new Blob(chunks, { type: fallbackMimeType }) : null;
+                if (blob && blob.size) {
+                  const blobUrl = URL.createObjectURL(blob);
+                  if (currentBlobUrlRef.current) {
+                    URL.revokeObjectURL(currentBlobUrlRef.current);
+                  }
+                  currentBlobUrlRef.current = blobUrl;
+                  audio.src = blobUrl;
+                  audio.load();
+                }
+              } catch (err) {
+                console.error('Fallback blob switch failed:', err);
+              }
+            };
+
+            const appendChunk = async (chunk, sourceBuffer) => {
+              if (!chunk || !sourceBuffer) return;
+
+              if (sourceBuffer.updating) {
+                await new Promise(resolve => {
+                  sourceBuffer.addEventListener('updateend', resolve, { once: true });
+                });
+              }
+
+              await new Promise((resolve, reject) => {
+                const onUpdate = () => {
+                  sourceBuffer.removeEventListener('updateend', onUpdate);
+                  sourceBuffer.removeEventListener('error', onError);
+                  resolve();
+                };
+
+                const onError = (e) => {
+                  sourceBuffer.removeEventListener('updateend', onUpdate);
+                  sourceBuffer.removeEventListener('error', onError);
+                  streamErrored = true;
+                  reject(e);
+                };
+
+                sourceBuffer.addEventListener('updateend', onUpdate);
+                sourceBuffer.addEventListener('error', onError);
+
+                try {
+                  sourceBuffer.appendBuffer(chunk);
+                } catch (err) {
+                  sourceBuffer.removeEventListener('updateend', onUpdate);
+                  sourceBuffer.removeEventListener('error', onError);
+                  reject(err);
+                }
+              });
+            };
+
+            const finalizeStream = new Promise((resolve, reject) => {
+              let sourceBuffer = null;
+              const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+
+              controller?.signal?.addEventListener('abort', onAbort, { once: true });
+
+              const pumpStream = async () => {
+                let pumpError = null;
+                let appendFailed = false;
+                try {
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (controller?.signal.aborted) {
+                      throw new DOMException('Aborted', 'AbortError');
+                    }
+
+                    const bufferChunk = toArrayBuffer(value);
+                    if (bufferChunk) {
+                      chunks.push(bufferChunk);
+                      if (!appendFailed) {
+                        try {
+                          await appendChunk(bufferChunk, sourceBuffer);
+                        } catch (err) {
+                          appendFailed = true;
+                          streamErrored = true;
+                        }
+                      }
+                    }
+                  }
+
+                  if (mediaSource.readyState === 'open') {
+                    try {
+                      mediaSource.endOfStream();
+                    } catch (err) {
+                      console.warn('MediaSource endOfStream warning:', err);
+                    }
+                  }
+                } catch (err) {
+                  pumpError = err;
+                  streamErrored = true;
+                } finally {
+                  if (controller?.signal.aborted) {
+                    reader.cancel().catch(() => {});
+                  }
+                  const blob = chunks.length ? new Blob(chunks, { type: fallbackMimeType }) : null;
+                  if (streamErrored || pumpError) {
+                    await switchToBufferedBlob();
+                  }
+                  return blob;
+                }
+              };
+
+              mediaSource.addEventListener('sourceopen', () => {
+                try {
+                  sourceBuffer = mediaSource.addSourceBuffer(supportedMime);
+                  sourceBuffer.mode = 'sequence';
+                  sourceBuffer.addEventListener('error', () => {
+                    streamErrored = true;
+                  });
+                  pumpStream().then(resolve).catch(reject);
+                } catch (err) {
+                  reject(err);
+                }
+              }, { once: true });
+
+              mediaSource.addEventListener('error', (err) => reject(err));
+            });
+
+            cachePromise = finalizeStream
+            .then((blob) => {
+              if (blob && blob.size) {
+                return cacheInstance.put('audio-files', { id: trackInfo.id, blob });
+              }
+              return null;
+            })
+            .catch((err) => {
+              if (err?.name !== 'AbortError') {
+                console.error('Cache error:', err);
+              }
+            })
+            .finally(() => {
+              if (currentStreamControllerRef.current === controller) {
+                currentStreamControllerRef.current = null;
+              }
+              currentStreamFinalizeRef.current = null;
+            });
+
+            currentStreamFinalizeRef.current = cachePromise;
+          } else {
+            // Fallback: download to blob (may require full download before play on non-MSE browsers)
+            const blob = await response.blob();
+            audioUrl = URL.createObjectURL(blob);
+            currentBlobUrlRef.current = audioUrl;
+
+            cachePromise = cacheInstance.put('audio-files', { id: trackInfo.id, blob })
+            .catch(err => console.error('Cache error:', err));
+          }
 
         } catch (err) {
           console.error('Error loading audio:', err);
@@ -1245,15 +1538,15 @@ export const AudioProvider = ({ children }) => {
         throw new Error('Audio not available offline');
       }
 
-      // Set audio source
+      if (!audioUrl || typeof audioUrl !== 'string' || audioUrl.length === 0) {
+        throw new Error('Invalid audio source URL generated or missing');
+      }
       audio.src = audioUrl;
       audio.crossOrigin = 'anonymous';
       audio.preload = 'auto';
 
-      // Create source node
       nodeManagerRef.current.createSourceForElement(audio);
 
-      // Load the audio
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('Audio loading timeout'));
@@ -1261,7 +1554,8 @@ export const AudioProvider = ({ children }) => {
 
         const cleanup = () => {
           clearTimeout(timeout);
-          audio.removeEventListener('canplaythrough', onCanPlay);
+          audio.removeEventListener('canplay', onCanPlay);
+          audio.removeEventListener('loadeddata', onCanPlay);
           audio.removeEventListener('error', onError);
         };
 
@@ -1271,62 +1565,85 @@ export const AudioProvider = ({ children }) => {
         };
 
         const onError = (e) => {
+          // If streaming is in progress, let fallback attempts complete before failing.
+          const streamingInProgress = currentStreamFinalizeRef.current && !!currentStreamControllerRef.current;
+          if (streamingInProgress) {
+            console.warn('Streaming error observed, waiting for fallback...');
+            return;
+          }
+
           cleanup();
           console.error('Audio load error event:', e);
           const errorMessage = audio.error?.message || 'Failed to load audio';
           reject(new Error(errorMessage));
         };
 
-        audio.addEventListener('canplaythrough', onCanPlay, { once: true });
+        audio.addEventListener('canplay', onCanPlay, { once: true });
+        audio.addEventListener('loadeddata', onCanPlay, { once: true });
         audio.addEventListener('error', onError, { once: true });
 
         audio.load();
       });
 
-      // Connect audio nodes
       connectAudioNodes();
 
-      setDuration(audio.duration || 0);
-      setCurrentTrack(trackInfo);
+      await ensureAudioReady();
 
-      // Update queue
+      getState().setDuration(audio.duration || 0);
+      getState().setCurrentTrack(trackInfo);
+
       if (addToQueueFlag) {
-        if (currentTrack) {
-          setQueueHistory(prev => [...prev, currentTrack]);
+        const prevTrack = getState().currentTrack;
+        if (prevTrack) {
+          const newHistory = [...getState().queueHistory, prevTrack];
+          getState().setQueueHistory(newHistory);
+          queueHistoryRef.current = newHistory;
         }
-        setQueue(prev => {
-          const newQueue = [...prev];
-          if (!newQueue.find(t => t.id === trackInfo.id)) {
-            newQueue.push(trackInfo);
-          }
-          return newQueue;
-        });
-        setQueueIndex(queue.length);
+
+        const currentQueue = getState().queue;
+        const existingIndex = currentQueue.findIndex(t => t.id === trackInfo.id);
+        let nextIndex = 0;
+
+        if (existingIndex !== -1) {
+          nextIndex = existingIndex;
+        } else {
+          nextIndex = currentQueue.length;
+          const nextQueue = [...currentQueue, trackInfo];
+          getState().setQueue(nextQueue);
+          queueRef.current = nextQueue;
+        }
+
+        getState().setQueueIndex(nextIndex);
+        queueIndexRef.current = nextIndex;
       }
 
-      // Start playback
       await audio.play();
-      setIsPlaying(true);
-      setLoading(false);
+      getState().setIsPlaying(true);
+      getState().setLoading(false);
 
-      // Apply EQSmart
-      if (eqSmartEnabled) {
-        applyEqSmartSettings(trackInfo.id);
+      const { eqSmartEnabled: smartEnabled, hearingCompensation: hearingComp, networkStatus: netStatus } = getState();
+      if (smartEnabled) {
+        // Apply EQSmart settings
+        if (hearingComp) {
+          // Apply ISO 226:2003 compensation preset
+          const isoPreset = EQ_PRESETS.advanced.find(p => p.id === 'iso-compensation');
+          if (isoPreset) {
+            applyEqPreset(isoPreset);
+          }
+        }
       }
 
-      // Update play count
-      if (networkStatus && MusicAPI.updatePlayCount) {
+      if (netStatus && MusicAPI.updatePlayCount) {
         MusicAPI.updatePlayCount(trackInfo.id).catch(console.error);
       }
 
-      // Start visualizer
       startVisualizer();
 
     } catch (error) {
       console.error('Playback error:', error);
-      setError(error.message || 'Failed to play track');
-      setLoading(false);
-      setIsPlaying(false);
+      getState().setError(error.message || 'Failed to play track');
+      getState().setLoading(false);
+      getState().setIsPlaying(false);
 
       if (currentBlobUrlRef.current) {
         URL.revokeObjectURL(currentBlobUrlRef.current);
@@ -1334,36 +1651,29 @@ export const AudioProvider = ({ children }) => {
       }
     }
   }, [
-    currentTrack,
-    isPlaying,
-    networkStatus,
-    offlineMode,
-    queue,
-    eqSmartEnabled,
-    dynamicEqEnabled,
     initializeAudio,
     connectAudioNodes,
-    applyEqSmartSettings,
+    ensureAudioReady,
     stopIntelligentAnalysis,
     startIntelligentAnalysis,
+    applyEqPreset,
+    stopActiveStream,
   ]);
 
   const togglePlay = useCallback(async () => {
+    const { currentTrack, isPlaying, eqSmartEnabled, dynamicEqEnabled } = getState();
     if (!currentTrack || !audioRef.current.src) return;
 
     try {
       if (isPlaying) {
         audioRef.current.pause();
-        setIsPlaying(false);
+        getState().setIsPlaying(false);
         stopVisualizer();
         stopIntelligentAnalysis();
       } else {
-        const ctx = nodeManagerRef.current?.getContext();
-        if (ctx?.state === 'suspended') {
-          await ctx.resume();
-        }
+        await ensureAudioReady();
         await audioRef.current.play();
-        setIsPlaying(true);
+        getState().setIsPlaying(true);
         startVisualizer();
         if (eqSmartEnabled && dynamicEqEnabled) {
           startIntelligentAnalysis();
@@ -1371,46 +1681,45 @@ export const AudioProvider = ({ children }) => {
       }
     } catch (error) {
       console.error('Toggle play error:', error);
-      setError('Playback error');
+      getState().setError('Playback error');
     }
-  }, [currentTrack, isPlaying, eqSmartEnabled, dynamicEqEnabled, startIntelligentAnalysis, stopIntelligentAnalysis]);
+  }, [ensureAudioReady, startIntelligentAnalysis, stopIntelligentAnalysis]);
 
   const seek = useCallback((time) => {
     if (!audioRef.current) return;
-    const clampedTime = Math.max(0, Math.min(time, duration));
+    const clampedTime = Math.max(0, Math.min(time, getState().duration));
     audioRef.current.currentTime = clampedTime;
-    setCurrentTime(clampedTime);
-  }, [duration]);
+    currentTimeRef.current = clampedTime;
+    getState().setCurrentTime(clampedTime);
+  }, []);
 
   const setAudioVolume = useCallback((value) => {
     const clampedVolume = Math.max(0, Math.min(1, value));
-    setVolume(clampedVolume);
+    getState().setVolume(clampedVolume);
 
     if (audioRef.current) {
       audioRef.current.volume = clampedVolume;
     }
 
     nodeManagerRef.current?.updateVolume(clampedVolume);
-
-    localStorage.setItem('volume', clampedVolume.toString());
   }, []);
 
   /* ───────────────────────────────────────────────
-   Q ueue Management                                          *
+   Q ueue Management       *
    ─────────────────────────────────────────────── */
 
   const addToQueue = useCallback((tracks, playImmediately = false) => {
     const tracksArray = Array.isArray(tracks) ? tracks : [tracks];
 
-    setQueue((prev) => {
-      const newQueue = [...prev];
-      tracksArray.forEach((track) => {
-        if (!newQueue.find(t => t.id === track.id)) {
-          newQueue.push(track);
-        }
-      });
-      return newQueue;
+    const currentQueue = getState().queue;
+    const newQueue = [...currentQueue];
+    tracksArray.forEach((track) => {
+      if (!newQueue.find(t => t.id === track.id)) {
+        newQueue.push(track);
+      }
     });
+    getState().setQueue(newQueue);
+    queueRef.current = newQueue;
 
     if (playImmediately && tracksArray.length > 0) {
       playTrack(tracksArray[0], false);
@@ -1418,34 +1727,44 @@ export const AudioProvider = ({ children }) => {
   }, [playTrack]);
 
   const removeFromQueue = useCallback((index) => {
-    if (index < 0 || index >= queue.length) return;
+    const queueSnapshot = queueRef.current;
+    if (index < 0 || index >= queueSnapshot.length) return;
 
-    setQueue((prev) => {
-      const newQueue = [...prev];
-      newQueue.splice(index, 1);
-      return newQueue;
-    });
+    const currentIndex = queueIndexRef.current;
+    const removedCurrent = index === currentIndex;
 
-    if (index < queueIndex) {
-      setQueueIndex((prev) => Math.max(0, prev - 1));
-    } else if (index === queueIndex && queue.length > 1) {
-      const nextIndex = Math.min(index, queue.length - 2);
-      setQueueIndex(nextIndex);
-      if (queue[nextIndex]) {
-        playTrack(queue[nextIndex], false);
-      }
+    const nextQueue = queueSnapshot.filter((_, i) => i !== index);
+    getState().setQueue(nextQueue);
+    queueRef.current = nextQueue;
+
+    let nextIndex = currentIndex;
+    if (index < currentIndex) {
+      nextIndex = Math.max(0, currentIndex - 1);
+    } else if (removedCurrent && nextQueue.length > 0) {
+      nextIndex = Math.min(index, nextQueue.length - 1);
+    } else if (nextQueue.length === 0) {
+      nextIndex = 0;
     }
-  }, [queue, queueIndex, playTrack]);
+
+    getState().setQueueIndex(nextIndex);
+    queueIndexRef.current = nextIndex;
+
+    if (removedCurrent && nextQueue[nextIndex]) {
+      playTrack(nextQueue[nextIndex], false);
+    }
+  }, [playTrack]);
 
   const playNext = useCallback(() => {
-    if (!queue.length) return;
+    const queueSnapshot = queueRef.current;
+    if (!queueSnapshot.length) return;
 
     let nextIndex;
+    const { shuffle } = getState();
 
     if (shuffle) {
-      const availableIndices = queue
+      const availableIndices = queueSnapshot
       .map((_, index) => index)
-      .filter(index => index !== queueIndex);
+      .filter(index => index !== queueIndexRef.current);
 
       if (availableIndices.length === 0) {
         nextIndex = 0;
@@ -1453,24 +1772,30 @@ export const AudioProvider = ({ children }) => {
         nextIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
       }
     } else {
-      nextIndex = (queueIndex + 1) % queue.length;
+      nextIndex = (queueIndexRef.current + 1) % queueSnapshot.length;
     }
 
-    setQueueIndex(nextIndex);
-    playTrack(queue[nextIndex], false);
-  }, [queue, queueIndex, shuffle, playTrack]);
+    getState().setQueueIndex(nextIndex);
+    queueIndexRef.current = nextIndex;
+    playTrack(queueSnapshot[nextIndex], false);
+  }, [playTrack]);
 
   const playPrevious = useCallback(() => {
-    if (!queue.length) return;
+    const queueSnapshot = queueRef.current;
+    if (!queueSnapshot.length) return;
 
+    const { currentTime, shuffle } = getState();
     if (currentTime > 3) {
       seek(0);
       return;
     }
 
-    if (queueHistory.length > 0) {
-      const previousTrack = queueHistory[queueHistory.length - 1];
-      setQueueHistory(prev => prev.slice(0, -1));
+    const historySnapshot = queueHistoryRef.current;
+    if (historySnapshot.length > 0) {
+      const previousTrack = historySnapshot[historySnapshot.length - 1];
+      const nextHistory = historySnapshot.slice(0, -1);
+      getState().setQueueHistory(nextHistory);
+      queueHistoryRef.current = nextHistory;
       playTrack(previousTrack, false);
       return;
     }
@@ -1478,71 +1803,41 @@ export const AudioProvider = ({ children }) => {
     let prevIndex;
 
     if (shuffle) {
-      prevIndex = Math.floor(Math.random() * queue.length);
+      prevIndex = Math.floor(Math.random() * queueSnapshot.length);
     } else {
-      prevIndex = queueIndex === 0 ? queue.length - 1 : queueIndex - 1;
+      prevIndex = queueIndexRef.current === 0 ? queueSnapshot.length - 1 : queueIndexRef.current - 1;
     }
 
-    setQueueIndex(prevIndex);
-    playTrack(queue[prevIndex], false);
-  }, [queue, queueIndex, queueHistory, currentTime, shuffle, playTrack, seek]);
+    getState().setQueueIndex(prevIndex);
+    queueIndexRef.current = prevIndex;
+    playTrack(queueSnapshot[prevIndex], false);
+  }, [playTrack, seek]);
+
+  const clearQueue = useCallback(() => {
+    getState().setQueue([]);
+    queueRef.current = [];
+    getState().setQueueIndex(0);
+    queueIndexRef.current = 0;
+    getState().setQueueHistory([]);
+    queueHistoryRef.current = [];
+  }, []);
 
   /* ───────────────────────────────────────────────
-   V isualizer                                                *
+   V isualizer             *
    ─────────────────────────────────────────────── */
 
   const startVisualizer = useCallback(() => {
-    const analyzer = nodeManagerRef.current?.getAnalyzer();
-    if (!analyzer || visualizerIntervalRef.current) return;
-
-    const dataArray = new Uint8Array(analyzer.frequencyBinCount);
-
-    visualizerIntervalRef.current = setInterval(() => {
-      analyzer.getByteFrequencyData(dataArray);
-
-      const ctx = nodeManagerRef.current?.getContext();
-      const sampleRate = ctx?.sampleRate || 44100;
-
-      const bandData = FREQUENCY_BANDS.map((band) => {
-        const nyquist = sampleRate / 2;
-        const startIndex = Math.floor((band.min / nyquist) * dataArray.length);
-        const endIndex = Math.floor((band.max / nyquist) * dataArray.length);
-
-        let sum = 0;
-        let count = 0;
-
-        for (let i = startIndex; i <= endIndex && i < dataArray.length; i++) {
-          sum += dataArray[i];
-          count++;
-        }
-
-        return {
-          name: band.name,
-          value: count > 0 ? sum / count / 255 : 0,
-          color: band.color,
-        };
-      });
-
-      setVisualizerData({
-        frequency: Array.from(dataArray),
-                        bands: bandData,
-                        timestamp: Date.now(),
-      });
-    }, 50);
+    // Visualizers consume the analyzer node directly; avoid per-frame React state.
+    if (!nodeManagerRef.current?.getAnalyzer()) return;
   }, []);
 
   const stopVisualizer = useCallback(() => {
-    if (visualizerIntervalRef.current) {
-      clearInterval(visualizerIntervalRef.current);
-      visualizerIntervalRef.current = null;
-    }
   }, []);
 
   /* ───────────────────────────────────────────────
-   E ffects & Event Handlers                                  *
+   E ffects & Event Handler*s
    ─────────────────────────────────────────────── */
 
-  // Resume audio context on user interaction
   useEffect(() => {
     const resumeContext = async () => {
       const ctx = nodeManagerRef.current?.getContext();
@@ -1568,7 +1863,6 @@ export const AudioProvider = ({ children }) => {
     };
   }, []);
 
-  // Audio event handlers
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -1576,63 +1870,72 @@ export const AudioProvider = ({ children }) => {
     const handlers = {
       loadstart: () => {
         console.log('Audio load started');
-        setBuffering(true);
+        getState().setBuffering(true);
       },
       loadeddata: () => {
         console.log('Audio data loaded');
-        setBuffering(false);
+        getState().setBuffering(false);
       },
       canplay: () => {
         console.log('Audio can play');
-        setBuffering(false);
+        getState().setBuffering(false);
       },
-      timeupdate: () => setCurrentTime(audio.currentTime),
-            durationchange: () => {
-              if (isFinite(audio.duration)) {
-                setDuration(audio.duration);
-              }
-            },
-            ended: () => {
-              setIsPlaying(false);
-              stopVisualizer();
-              stopIntelligentAnalysis();
+      timeupdate: () => {
+        const time = audio.currentTime;
+        currentTimeRef.current = time;
+        const now = performance.now();
+        const delta = Math.abs(time - getState().currentTime);
+        if (delta > 0.25 || now - lastCurrentTimeCommitRef.current > 250) {
+          lastCurrentTimeCommitRef.current = now;
+          getState().setCurrentTime(time);
+        }
+      },
+      durationchange: () => {
+        if (isFinite(audio.duration)) {
+          getState().setDuration(audio.duration);
+        }
+      },
+      ended: () => {
+        getState().setIsPlaying(false);
+        stopVisualizer();
+        stopIntelligentAnalysis();
 
-              if (repeat === 'one') {
-                audio.currentTime = 0;
-                audio.play().catch(console.error);
-              } else if (repeat === 'all' || queueIndex < queue.length - 1) {
-                playNext();
-              }
-            },
-            error: (e) => {
+        const { repeat, queueIndex, queue } = getState();
+        if (repeat === 'one') {
+          audio.currentTime = 0;
+          audio.play().catch(console.error);
+        } else if (repeat === 'all' || queueIndex < queue.length - 1) {
+          playNext();
+        }
+      },
+      error: (e) => {
+        const errorMessage = audio.error?.message || 'Unknown playback error';
+        console.error('Audio error details:', {
+          code: audio.error?.code,
+          message: errorMessage,
+          networkState: audio.networkState,
+          readyState: audio.readyState,
+          src: audio.src
+        });
 
-              const errorMessage = audio.error?.message || 'Unknown playback error';
-  console.error('Audio error details:', {
-    code: audio.error?.code,
-    message: errorMessage,
-    networkState: audio.networkState,
-    readyState: audio.readyState,
-    src: audio.src
-  });
-
-
-  setIsPlaying(false);
-  setBuffering(false);
-  stopVisualizer();
-  stopIntelligentAnalysis();
-            },
-            waiting: () => setBuffering(true),
-            playing: () => {
-              setBuffering(false);
-              setIsPlaying(true);
-            },
-            pause: () => {
-              setIsPlaying(false);
-            },
-            stalled: () => {
-              console.log('Audio stalled');
-              setBuffering(true);
-            },
+        getState().setIsPlaying(false);
+        getState().setBuffering(false);
+        stopVisualizer();
+        stopIntelligentAnalysis();
+      },
+      waiting: () => getState().setBuffering(true),
+      playing: () => {
+        getState().setBuffering(false);
+        getState().setIsPlaying(true);
+        ensureAudioReady();
+      },
+      pause: () => {
+        getState().setIsPlaying(false);
+      },
+      stalled: () => {
+        console.log('Audio stalled');
+        getState().setBuffering(true);
+      },
     };
 
     Object.entries(handlers).forEach(([event, handler]) => {
@@ -1644,12 +1947,11 @@ export const AudioProvider = ({ children }) => {
         audio.removeEventListener(event, handler);
       });
     };
-  }, [repeat, queue.length, queueIndex, playNext, stopVisualizer, stopIntelligentAnalysis]);
+  }, [ensureAudioReady, playNext, stopVisualizer, stopIntelligentAnalysis]);
 
-  // Network status
   useEffect(() => {
-    const handleOnline = () => setNetworkStatus(true);
-    const handleOffline = () => setNetworkStatus(false);
+    const handleOnline = () => getState().setNetworkStatus(true);
+    const handleOffline = () => getState().setNetworkStatus(false);
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -1660,83 +1962,193 @@ export const AudioProvider = ({ children }) => {
     };
   }, []);
 
-  // Persist settings
   useEffect(() => {
-    localStorage.setItem('eq-mode', eqMode);
-  }, [eqMode]);
-
-  useEffect(() => {
-    localStorage.setItem('eq-gains', JSON.stringify(eqGains));
-  }, [eqGains]);
-
-  useEffect(() => {
-    localStorage.setItem('advanced-eq-gains', JSON.stringify(advancedEqGains));
-  }, [advancedEqGains]);
-
-  useEffect(() => {
-    localStorage.setItem('eq-smart-enabled', eqSmartEnabled.toString());
-  }, [eqSmartEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem('dynamic-eq-enabled', dynamicEqEnabled.toString());
-  }, [dynamicEqEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem('shuffle', shuffle.toString());
-  }, [shuffle]);
-
-  useEffect(() => {
-    localStorage.setItem('repeat', repeat);
-  }, [repeat]);
-
-  // Update filters when gains change (manual mode)
-  useEffect(() => {
-    if (!nodeManagerRef.current || (eqSmartEnabled && dynamicEqEnabled)) return;
-
-    if (eqMode === 'standard') {
-      eqGains.forEach((gain, index) => {
-        nodeManagerRef.current.updateFilterGain('standard', index, gain);
+    return () => {
+      Object.values(persistTimeoutRef.current).forEach((timeoutId) => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
       });
-    }
-  }, [eqGains, eqMode, eqSmartEnabled, dynamicEqEnabled]);
+    };
+  }, []);
 
+  // Subscribe to EQ gains changes for persistence (debounced)
   useEffect(() => {
-    if (!nodeManagerRef.current || (eqSmartEnabled && dynamicEqEnabled)) return;
+    const unsubStandard = store.subscribe(
+      (state) => state.eqGains,
+      (gains) => {
+        if (!getState().eqSmartProcessing) {
+          schedulePersist('eq-gains', gains, 'standard');
+        }
+      }
+    );
+    const unsubAdvanced = store.subscribe(
+      (state) => state.advancedEqGains,
+      (gains) => {
+        if (!getState().eqSmartProcessing) {
+          schedulePersist('advanced-eq-gains', gains, 'advanced');
+        }
+      }
+    );
+    return () => {
+      unsubStandard();
+      unsubAdvanced();
+    };
+  }, [schedulePersist]);
 
-    if (eqMode === 'advanced') {
-      advancedEqGains.forEach((gain, index) => {
-        nodeManagerRef.current.updateFilterGain('advanced', index, gain);
-      });
-    }
-  }, [advancedEqGains, eqMode, eqSmartEnabled, dynamicEqEnabled]);
+  // Subscribe to headroom compensation (debounced to prevent excessive calls)
+  useEffect(() => {
+    let debounceTimer = null;
+    let prevGainsHash = '';
+
+    const unsub = store.subscribe(
+      (state) => ({
+        eqMode: state.eqMode,
+        eqGains: state.eqGains,
+        advancedEqGains: state.advancedEqGains,
+        headroom: state.eqSmartSettings.headroom,
+      }),
+      ({ eqMode, eqGains, advancedEqGains }) => {
+        const gains = eqMode === 'advanced' ? advancedEqGains : eqGains;
+        const gainsHash = gains.join(',');
+
+        // Only apply if gains actually changed
+        if (gainsHash !== prevGainsHash) {
+          prevGainsHash = gainsHash;
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            applyHeadroomCompensation(gains);
+          }, 16); // ~60fps
+        }
+      }
+    );
+
+    return () => {
+      unsub();
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [applyHeadroomCompensation]);
+
+  // Subscribe to bass tone changes
+  useEffect(() => {
+    const unsub = store.subscribe(
+      (state) => state.bassTone,
+      (bassTone) => {
+        const delta = bassTone - prevBassToneRef.current;
+        if (delta === 0) return;
+
+        const { eqMode, eqGains, advancedEqGains } = getState();
+        const freqs = eqMode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES;
+        const current = eqMode === 'advanced' ? advancedEqGains : eqGains;
+
+        const adjusted = current.map((gain, index) => {
+          const freq = freqs[index] || 0;
+          const weight = freq <= 80 ? 1 : freq <= 200 ? 0.6 : freq <= 320 ? 0.35 : 0;
+          const nextGain = gain + delta * weight;
+          return Math.max(-12, Math.min(12, nextGain));
+        });
+
+        prevBassToneRef.current = bassTone;
+        applyRealtimeEQ(adjusted, { updateState: true });
+      }
+    );
+    return unsub;
+  }, [applyRealtimeEQ]);
+
+  // Subscribe to filter updates (manual mode)
+  useEffect(() => {
+    const unsubStandard = store.subscribe(
+      (state) => ({ gains: state.eqGains, mode: state.eqMode, smart: state.eqSmartEnabled, dynamic: state.dynamicEqEnabled }),
+      ({ gains, mode, smart, dynamic }) => {
+        if (!nodeManagerRef.current || (smart && dynamic)) return;
+        if (mode === 'standard') {
+          gains.forEach((gain, index) => {
+            nodeManagerRef.current.updateFilterGain('standard', index, gain);
+          });
+        }
+      }
+    );
+    const unsubAdvanced = store.subscribe(
+      (state) => ({ gains: state.advancedEqGains, mode: state.eqMode, smart: state.eqSmartEnabled, dynamic: state.dynamicEqEnabled }),
+      ({ gains, mode, smart, dynamic }) => {
+        if (!nodeManagerRef.current || (smart && dynamic)) return;
+        if (mode === 'advanced') {
+          gains.forEach((gain, index) => {
+            nodeManagerRef.current.updateFilterGain('advanced', index, gain);
+          });
+        }
+      }
+    );
+    return () => {
+      unsubStandard();
+      unsubAdvanced();
+    };
+  }, []);
 
   // Reconnect nodes when EQ mode changes
   useEffect(() => {
-    if (nodeManagerRef.current && audioRef.current.src && nodeManagerRef.current.isConnected) {
-      // Disconnect and reconnect with new mode
-      nodeManagerRef.current.disconnect();
-      nodeManagerRef.current.connect(eqMode);
-    }
-  }, [eqMode]);
+    const unsub = store.subscribe(
+      (state) => state.eqMode,
+      (eqMode) => {
+        if (nodeManagerRef.current && audioRef.current.src && nodeManagerRef.current.isConnected) {
+          nodeManagerRef.current.disconnect();
+          nodeManagerRef.current.connect(eqMode);
+        }
+      }
+    );
+    return unsub;
+  }, []);
 
-  // Start/stop intelligent analysis
+  // Track if analysis/mic is running to prevent recursion
+  const isAnalysisRunningRef = useRef(false);
+  const isMicRequestingRef = useRef(false);
+
+  // Start/stop intelligent analysis based on store state (with guard against recursion)
   useEffect(() => {
-    if (eqSmartEnabled && dynamicEqEnabled && isPlaying && !isDraggingEQ) {
-      startIntelligentAnalysis();
-    } else {
-      stopIntelligentAnalysis();
-    }
+    let prevShouldRun = false;
+
+    const unsub = store.subscribe(
+      (state) => ({
+        smart: state.eqSmartEnabled,
+        dynamic: state.dynamicEqEnabled,
+        playing: state.isPlaying,
+        dragging: state.isDraggingEQ
+      }),
+      ({ smart, dynamic, playing, dragging }) => {
+        const shouldRun = smart && dynamic && playing && !dragging;
+
+        // Only act on actual changes to prevent recursion
+        if (shouldRun !== prevShouldRun) {
+          prevShouldRun = shouldRun;
+          if (shouldRun && !isAnalysisRunningRef.current) {
+            isAnalysisRunningRef.current = true;
+            startIntelligentAnalysis();
+          } else if (!shouldRun && isAnalysisRunningRef.current) {
+            isAnalysisRunningRef.current = false;
+            stopIntelligentAnalysis();
+          }
+        }
+      }
+    );
 
     return () => {
+      unsub();
+      isAnalysisRunningRef.current = false;
       stopIntelligentAnalysis();
     };
-  }, [eqSmartEnabled, dynamicEqEnabled, isPlaying, isDraggingEQ, startIntelligentAnalysis, stopIntelligentAnalysis]);
+  }, [startIntelligentAnalysis, stopIntelligentAnalysis]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       stopVisualizer();
-      stopIntelligentAnalysis();
+      isAnalysisRunningRef.current = false;
+      if (analysisIntervalRef.current) {
+        clearInterval(analysisIntervalRef.current);
+        analysisIntervalRef.current = null;
+      }
+      stopActiveStream();
+      stopMicrophoneCapture();
 
       if (currentBlobUrlRef.current) {
         URL.revokeObjectURL(currentBlobUrlRef.current);
@@ -1747,106 +2159,236 @@ export const AudioProvider = ({ children }) => {
         ctx.close().catch(console.error);
       }
     };
-  }, [stopVisualizer, stopIntelligentAnalysis]);
+  }, [stopVisualizer, stopActiveStream, stopMicrophoneCapture]);
+
+  // Subscribe to smart EQ state for microphone access (with guard against recursion)
+  useEffect(() => {
+    let prevShouldCapture = false;
+
+    const unsub = store.subscribe(
+      (state) => ({ smart: state.eqSmartEnabled, dynamic: state.dynamicEqEnabled }),
+      ({ smart, dynamic }) => {
+        const shouldCapture = smart && dynamic;
+
+        // Only act on actual changes to prevent recursion
+        if (shouldCapture !== prevShouldCapture) {
+          prevShouldCapture = shouldCapture;
+          if (shouldCapture && !isMicRequestingRef.current) {
+            isMicRequestingRef.current = true;
+            requestMicrophoneAccess().finally(() => {
+              isMicRequestingRef.current = false;
+            });
+          } else if (!shouldCapture) {
+            stopMicrophoneCapture();
+          }
+        }
+      }
+    );
+
+    return unsub;
+  }, [requestMicrophoneAccess, stopMicrophoneCapture]);
+
+  // Mic level monitoring with subscription
+  useEffect(() => {
+    let rafId = null;
+
+    const normalizeDb = (db) => {
+      const clamped = Math.min(-15, Math.max(-110, db));
+      return Math.max(0, Math.min(1, (clamped + 110) / 95));
+    };
+
+    const updateMicLevel = () => {
+      if (micAnalyzerRef.current && getState().micStatus === 'active') {
+        const analyzer = micAnalyzerRef.current;
+        if (!micFreqBufferRef.current || micFreqBufferRef.current.length !== analyzer.frequencyBinCount) {
+          micFreqBufferRef.current = new Float32Array(analyzer.frequencyBinCount);
+        }
+        const freqData = micFreqBufferRef.current;
+        const dataArray = new Uint8Array(analyzer.fftSize);
+        analyzer.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const sample = dataArray[i] - 128;
+          sumSquares += sample * sample;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length) / 128;
+        const level = Math.max(0, Math.min(1, rms));
+        micLevelRef.current = level;
+
+        const now = performance.now();
+        const levelDelta = Math.abs(level - committedMicLevelRef.current);
+        if (levelDelta > 0.02 || now - lastMicLevelCommitRef.current > 120) {
+          committedMicLevelRef.current = level;
+          lastMicLevelCommitRef.current = now;
+          getState().setMicLevel(level);
+        }
+
+        // Periodic ambient snapshot
+        if (freqData && micFrameCountRef.current++ % 6 === 0) {
+          analyzer.getFloatFrequencyData(freqData);
+          const nyquist = (analyzer.context?.sampleRate || 48000) / 2;
+          const bands = FREQUENCY_BANDS.map((band) => {
+            const startBin = Math.max(0, Math.floor((band.min / nyquist) * freqData.length));
+            const endBin = Math.min(freqData.length - 1, Math.floor((band.max / nyquist) * freqData.length));
+            let sum = 0;
+            let count = 0;
+            for (let i = startBin; i <= endBin; i++) {
+              sum += freqData[i];
+              count++;
+            }
+            const avg = count ? sum / count : -110;
+            return normalizeDb(avg);
+          });
+
+          const overall = bands.reduce((s, v) => s + v, 0) / Math.max(1, bands.length);
+          const peak = Math.max(...bands);
+          const floor = Math.min(...bands);
+
+          getState().setAmbientSnapshot({
+            bands,
+            overall,
+            peak,
+            floor,
+            micLevel: level,
+            timestamp: Date.now(),
+          });
+        }
+      }
+      rafId = requestAnimationFrame(updateMicLevel);
+    };
+
+    // Subscribe to micStatus changes
+    const unsub = store.subscribe(
+      (state) => state.micStatus,
+      (micStatus) => {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        if (micStatus === 'active') {
+          updateMicLevel();
+        }
+      }
+    );
+
+    // Initialize if already active
+    if (getState().micStatus === 'active') {
+      updateMicLevel();
+    }
+
+    return () => {
+      unsub();
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, []);
 
   /* ───────────────────────────────────────────────
-   C ontext Value            *
+   C ontext Value (Methods only - state via Zustand)
    ─────────────────────────────────────────────── */
 
+  // These getters allow components to access refs without subscribing to context changes
+  const getAudioContext = useCallback(() => nodeManagerRef.current?.getContext(), []);
+  const getAnalyzerNode = useCallback(() => nodeManagerRef.current?.getAnalyzer(), []);
+
+  // Helper methods for EQ mode switching
+  const setEqModeWithReconnect = useCallback((mode) => {
+    getState().setEqMode(mode);
+    if (nodeManagerRef.current && audioRef.current.src && nodeManagerRef.current.isConnected) {
+      nodeManagerRef.current.disconnect();
+      nodeManagerRef.current.connect(mode);
+    }
+  }, []);
+
+  const toggleEqMode = useCallback(() => {
+    const newMode = getState().eqMode === 'standard' ? 'advanced' : 'standard';
+    setEqModeWithReconnect(newMode);
+  }, [setEqModeWithReconnect]);
+
+  // EQ Smart settings setter with validation
+  const setEqSmartSettingsValidated = useCallback((updater) => {
+    const prev = getState().eqSmartSettings;
+    const nextValue = typeof updater === 'function' ? updater(prev) : updater;
+    getState().setEqSmartSettings({
+      intensity: Math.max(0.4, Math.min(1.6, nextValue.intensity ?? prev.intensity)),
+      bassTilt: Math.max(-6, Math.min(6, nextValue.bassTilt ?? prev.bassTilt)),
+      trebleTilt: Math.max(-6, Math.min(6, nextValue.trebleTilt ?? prev.trebleTilt)),
+      headroom: Math.max(0, Math.min(12, nextValue.headroom ?? prev.headroom)),
+      micBlend: Math.max(0, Math.min(1, nextValue.micBlend ?? prev.micBlend)),
+    });
+  }, []);
+
+  // Toggle helpers
+  const toggleEqSmart = useCallback(() => {
+    const next = !getState().eqSmartEnabled;
+    getState().setEqSmartEnabled(next);
+    getState().setDynamicEqEnabled(next);
+  }, []);
+
+  const toggleDynamicEq = useCallback(() => {
+    getState().setDynamicEqEnabled(!getState().dynamicEqEnabled);
+  }, []);
+
+  const toggleUltraEq = useCallback(() => {
+    getState().setUltraEqEnabled(!getState().ultraEqEnabled);
+  }, []);
+
+  const toggleHearingCompensation = useCallback(() => {
+    getState().setHearingCompensation(!getState().hearingCompensation);
+  }, []);
+
+  const toggleOfflineMode = useCallback(() => {
+    getState().setOfflineMode(!getState().offlineMode);
+  }, []);
+
+  // Minimal context value - only methods and refs, NO state
+  // State should be accessed via Zustand selectors in components
   const contextValue = useMemo(() => ({
-    // Audio nodes
-    audioContext: nodeManagerRef.current?.getContext(),
-                                      analyzerNode: nodeManagerRef.current?.getAnalyzer(),
+    // Audio node accessors (refs)
+    getAudioContext,
+    getAnalyzerNode,
 
-                                      // EQ state
-                                      eqMode,
-                                      setEqMode: (mode) => {
-                                        setEqMode(mode);
-                                        // Force reconnection when switching modes
-                                        if (nodeManagerRef.current && audioRef.current.src && nodeManagerRef.current.isConnected) {
-                                          nodeManagerRef.current.disconnect();
-                                          nodeManagerRef.current.connect(mode);
-                                        }
-                                      },
-                                      toggleEqMode: () => {
-                                        const newMode = eqMode === 'standard' ? 'advanced' : 'standard';
-                                        setEqMode(newMode);
-                                        // Force reconnection when toggling modes
-                                        if (nodeManagerRef.current && audioRef.current.src && nodeManagerRef.current.isConnected) {
-                                          nodeManagerRef.current.disconnect();
-                                          nodeManagerRef.current.connect(newMode);
-                                        }
-                                      },
-                                      eqGains,
-                                      setEqGain,
-                                      advancedEqGains,
-                                      setAdvancedEqGain,
-                                      resetEq,
-                                      targetEqGains,
-                                      targetAdvancedEqGains,
-                                      applyEqPreset,
+    // EQ methods
+    setEqMode: setEqModeWithReconnect,
+    toggleEqMode,
+    setEqGain,
+    setAdvancedEqGain,
+    resetEq,
+    applyEqPreset,
+    setBassTone: (tone) => getState().setBassTone(tone),
 
-                                      // EQ drag state
-                                      startEqDrag: () => setIsDraggingEQ(true),
-                                      endEqDrag: () => setIsDraggingEQ(false),
+    // EQ drag state
+    startEqDrag: () => getState().setIsDraggingEQ(true),
+    endEqDrag: () => getState().setIsDraggingEQ(false),
 
-                                      // EQSmart
-                                      eqSmartEnabled,
-                                      toggleEqSmart: () => setEqSmartEnabled(prev => !prev),
-                                      eqSmartProcessing,
-                                      eqSmartSuggestions,
-                                      applyEqSmartSettings,
-                                      dynamicEqEnabled,
-                                      toggleDynamicEq: () => setDynamicEqEnabled(prev => !prev),
-                                      realtimeAnalysisData,
+    // EQSmart methods
+    toggleEqSmart,
+    setEqSmartSettings: setEqSmartSettingsValidated,
+    requestMicrophoneAccess,
+    toggleDynamicEq,
 
-                                      // Playback state
-                                      currentTrack,
-                                      isPlaying,
-                                      duration,
-                                      currentTime,
-                                      volume,
-                                      buffering,
-                                      loading,
-                                      error,
+    // Ultra EQ methods
+    toggleUltraEq,
+    toggleHearingCompensation,
 
-                                      // Playback controls
-                                      playTrack,
-                                      togglePlay,
-                                      seek,
-                                      setVolume: setAudioVolume,
+    // Playback controls
+    playTrack,
+    togglePlay,
+    seek,
+    setVolume: setAudioVolume,
 
-                                      // Queue
-                                      queue,
-                                      queueIndex,
-                                      queueHistory,
-                                      addToQueue,
-                                      removeFromQueue,
-                                      clearQueue: () => {
-                                        setQueue([]);
-                                        setQueueIndex(0);
-                                        setQueueHistory([]);
-                                      },
-                                      playNext,
-                                      playPrevious,
+    // Queue methods
+    addToQueue,
+    removeFromQueue,
+    clearQueue,
+    playNext,
+    playPrevious,
 
-                                      // Settings
-                                      shuffle,
-                                      toggleShuffle: () => setShuffle(prev => !prev),
-                                      repeat,
-                                      toggleRepeat: () => setRepeat(prev => {
-                                        if (prev === 'none') return 'all';
-                                        if (prev === 'all') return 'one';
-                                        return 'none';
-                                      }),
+    // Settings
+    toggleShuffle,
+    toggleRepeat,
 
-                                      // Network
-                                      networkStatus,
-                                      offlineMode,
-                                      toggleOfflineMode: () => setOfflineMode(prev => !prev),
-
-                                      // Visualizer
-                                      visualizerData,
+    // Network
+    toggleOfflineMode,
 
                                       // Cache management
                                       clearCache: async () => {
@@ -1910,17 +2452,6 @@ export const AudioProvider = ({ children }) => {
                                         }
                                       },
 
-                                      // Constants
-                                      frequencies: {
-                                        standard: STANDARD_FREQUENCIES,
-                                        advanced: ADVANCED_FREQUENCIES,
-                                      },
-                                      frequencyBands: FREQUENCY_BANDS,
-                                      presets: EQ_PRESETS,
-
-                                      // Real-time config
-                                      realtimeConfig: REALTIME_CONFIG,
-
                                       // Utility functions
                                       checkAuthentication: async () => {
                                         const token = localStorage.getItem('token');
@@ -1940,7 +2471,7 @@ export const AudioProvider = ({ children }) => {
                                       },
 
                                       prefetchTrack: async (track) => {
-                                        if (!track?.id || !networkStatus) return;
+                                        if (!track?.id || !getState().networkStatus) return;
 
                                         try {
                                           const cachedAudio = await cacheInstance.get('audio-files', track.id);
@@ -1977,7 +2508,24 @@ export const AudioProvider = ({ children }) => {
 
                                             const arrayBuffer = await audioFile.blob.arrayBuffer();
                                             const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-                                            const waveform = AudioAnalyzer.generateWaveform(audioBuffer);
+
+                                            // Generate waveform
+                                            const channelData = audioBuffer.getChannelData(0);
+                                            const samples = 1000;
+                                            const blockSize = Math.floor(channelData.length / samples);
+                                            const waveform = new Float32Array(samples);
+
+                                            for (let i = 0; i < samples; i++) {
+                                              const start = i * blockSize;
+                                              const end = Math.min(start + blockSize, channelData.length);
+
+                                              let sum = 0;
+                                              for (let j = start; j < end; j++) {
+                                                sum += Math.abs(channelData[j]);
+                                              }
+
+                                              waveform[i] = sum / (end - start);
+                                            }
 
                                             await cacheInstance.put('waveforms', {
                                               trackId,
@@ -1997,154 +2545,461 @@ export const AudioProvider = ({ children }) => {
 
                                       // Analysis info for UI
                                       getAnalysisInfo: () => {
-                                        if (!intelligentAnalyzerRef.current) return null;
+                                        if (!ultraAnalyzerRef.current) return null;
 
                                         return {
-                                          contentType: intelligentAnalyzerRef.current.contentType,
-                                          spectralBalance: intelligentAnalyzerRef.current.spectralBalance,
-                                          adaptiveParams: intelligentAnalyzerRef.current.adaptiveParams,
-                                          dynamicRange: intelligentAnalyzerRef.current.dynamicRange,
+                                          contentType: ultraAnalyzerRef.current.contentType,
+                                          spectralBalance: ultraAnalyzerRef.current.spectralBalance,
+                                          adaptiveParams: ultraAnalyzerRef.current.adaptiveParams,
+                                          dynamicRange: ultraAnalyzerRef.current.dynamicRange,
                                         };
                                       },
 
-                                      // Export audio state for debugging
-                                      getAudioState: () => ({
-                                        audioContextState: nodeManagerRef.current?.getContext()?.state,
-                                                            audioInitialized: !!nodeManagerRef.current,
-                                                            currentTime: audioRef.current?.currentTime,
-                                                            duration: audioRef.current?.duration,
-                                                            src: audioRef.current?.src,
-                                                            volume: audioRef.current?.volume,
-                                                            paused: audioRef.current?.paused,
-                                                            readyState: audioRef.current?.readyState,
-                                                            networkState: audioRef.current?.networkState,
-                                                            error: audioRef.current?.error,
-                                                            sourceNodeConnected: nodeManagerRef.current?.isConnected,
-                                                            currentMode: nodeManagerRef.current?.currentMode,
-                                      }),
+    // Export audio state for debugging
+    getAudioState: () => ({
+      audioContextState: nodeManagerRef.current?.getContext()?.state,
+      audioInitialized: !!nodeManagerRef.current,
+      currentTime: audioRef.current?.currentTime,
+      duration: audioRef.current?.duration,
+      src: audioRef.current?.src,
+      volume: audioRef.current?.volume,
+      paused: audioRef.current?.paused,
+      readyState: audioRef.current?.readyState,
+      networkState: audioRef.current?.networkState,
+      error: audioRef.current?.error,
+      sourceNodeConnected: nodeManagerRef.current?.isConnected,
+      currentMode: nodeManagerRef.current?.currentMode,
+    }),
 
-                                      // EQ curve export/import
-                                      exportEQCurve: () => {
-                                        const curve = eqMode === 'advanced' ? advancedEqGains : eqGains;
-                                        return {
-                                          version: '3.0',
-                                          mode: eqMode,
-                                          frequencies: eqMode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES,
-                                          gains: curve,
-                                          timestamp: new Date().toISOString(),
-                                        };
-                                      },
+    // EQ curve export/import
+    exportEQCurve: () => {
+      const { eqMode, eqGains, advancedEqGains, ultraEqEnabled, hearingCompensation, dynamicEqEnabled, eqSmartEnabled } = getState();
+      const curve = eqMode === 'advanced' ? advancedEqGains : eqGains;
+      return {
+        version: '3.0',
+        mode: eqMode,
+        frequencies: eqMode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES,
+        gains: curve,
+        timestamp: new Date().toISOString(),
+        ultraSettings: {
+          ultraEqEnabled,
+          hearingCompensation,
+          dynamicEqEnabled,
+          eqSmartEnabled,
+        }
+      };
+    },
 
-                                      importEQCurve: (data) => {
-                                        try {
-                                          if (!data || !data.gains || !Array.isArray(data.gains)) {
-                                            throw new Error('Invalid EQ curve data');
+    importEQCurve: (data) => {
+      try {
+        if (!data || !data.gains || !Array.isArray(data.gains)) {
+          throw new Error('Invalid EQ curve data');
+        }
+
+        const targetFreqs = data.mode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES;
+
+        if (data.gains.length !== targetFreqs.length) {
+          throw new Error('Incompatible frequency count');
+        }
+
+        const { eqMode } = getState();
+        if (data.mode === 'advanced' && eqMode === 'advanced') {
+          data.gains.forEach((gain, index) => {
+            setAdvancedEqGain(index, gain);
+          });
+        } else if (data.mode === 'standard' && eqMode === 'standard') {
+          data.gains.forEach((gain, index) => {
+            setEqGain(index, gain);
+          });
+        } else {
+          throw new Error('EQ mode mismatch');
+        }
+
+        // Import ultra settings if available
+        if (data.ultraSettings) {
+          if (typeof data.ultraSettings.ultraEqEnabled === 'boolean') {
+            getState().setUltraEqEnabled(data.ultraSettings.ultraEqEnabled);
+          }
+          if (typeof data.ultraSettings.hearingCompensation === 'boolean') {
+            getState().setHearingCompensation(data.ultraSettings.hearingCompensation);
+          }
+          if (typeof data.ultraSettings.eqSmartEnabled === 'boolean') {
+            getState().setEqSmartEnabled(data.ultraSettings.eqSmartEnabled);
+          }
+          if (typeof data.ultraSettings.dynamicEqEnabled === 'boolean') {
+            const shouldEnableDynamic = data.ultraSettings.dynamicEqEnabled ||
+              data.ultraSettings.eqSmartEnabled === true;
+            getState().setDynamicEqEnabled(shouldEnableDynamic);
+          } else if (data.ultraSettings.eqSmartEnabled === true) {
+            getState().setDynamicEqEnabled(true);
+          }
+        }
+
+        return true;
+      } catch (error) {
+        console.error('Import error:', error);
+        return false;
+      }
+    },
+
+    // Force audio context initialization (useful for debugging)
+    forceInitAudio: async () => {
+      try {
+        await initializeAudio();
+        console.log('Audio context force initialized');
+        return true;
+      } catch (error) {
+        console.error('Force init failed:', error);
+        return false;
+      }
+    },
+
+    // Manual connection refresh (useful for fixing connection issues)
+    refreshConnections: () => {
+      if (nodeManagerRef.current && audioRef.current.src) {
+        console.log('Refreshing audio connections...');
+        nodeManagerRef.current.disconnect();
+        nodeManagerRef.current.connect(getState().eqMode);
+        return true;
+      }
+      return false;
+    },
+
+                                      // Get ISO 226:2003 compensation for a specific frequency
+                                      getISO226Compensation: (frequency) => {
+                                        if (!ultraAnalyzerRef.current) {
+                                          // Fallback calculation
+                                          const freqs = Object.keys(EQUAL_LOUDNESS_COMPENSATION).map(Number).sort((a, b) => a - b);
+                                          for (let i = 0; i < freqs.length - 1; i++) {
+                                            if (frequency >= freqs[i] && frequency <= freqs[i + 1]) {
+                                              const f1 = freqs[i];
+                                              const f2 = freqs[i + 1];
+                                              const c1 = EQUAL_LOUDNESS_COMPENSATION[f1];
+                                              const c2 = EQUAL_LOUDNESS_COMPENSATION[f2];
+
+                                              const ratio = (frequency - f1) / (f2 - f1);
+                                              return c1 + (c2 - c1) * ratio;
+                                            }
                                           }
-
-                                          const targetFreqs = data.mode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES;
-
-                                          if (data.gains.length !== targetFreqs.length) {
-                                            throw new Error('Incompatible frequency count');
-                                          }
-
-                                          if (data.mode === 'advanced' && eqMode === 'advanced') {
-                                            data.gains.forEach((gain, index) => {
-                                              setAdvancedEqGain(index, gain);
-                                            });
-                                          } else if (data.mode === 'standard' && eqMode === 'standard') {
-                                            data.gains.forEach((gain, index) => {
-                                              setEqGain(index, gain);
-                                            });
-                                          } else {
-                                            throw new Error('EQ mode mismatch');
-                                          }
-
-                                          return true;
-                                        } catch (error) {
-                                          console.error('Import error:', error);
-                                          return false;
+                                          return 0;
                                         }
+
+                                        return ultraAnalyzerRef.current.applyISO226Compensation(frequency);
                                       },
 
-                                      // Force audio context initialization (useful for debugging)
-                                      forceInitAudio: async () => {
+                                      // Analyze audio file for hearing enhancement recommendations
+                                      analyzeForHearing: async (audioFile) => {
                                         try {
                                           await initializeAudio();
-                                          console.log('Audio context force initialized');
+                                          const ctx = nodeManagerRef.current?.getContext();
+                                          if (!ctx) return null;
+
+                                          const arrayBuffer = await audioFile.arrayBuffer();
+                                          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+                                          const channelData = audioBuffer.getChannelData(0);
+                                          const sampleRate = audioBuffer.sampleRate;
+
+                                          // Analyze frequency content
+                                          const analyzer = ctx.createAnalyser();
+                                          analyzer.fftSize = 8192;
+                                          const freqData = new Float32Array(analyzer.frequencyBinCount);
+
+                                          // Process in chunks
+                                          const chunkSize = analyzer.fftSize;
+                                          const chunks = Math.floor(channelData.length / chunkSize);
+                                          const frequencyProfile = new Float32Array(analyzer.frequencyBinCount);
+
+                                          for (let i = 0; i < chunks; i++) {
+                                            const chunk = channelData.slice(i * chunkSize, (i + 1) * chunkSize);
+
+                                            // Simple FFT approximation (in production, use proper FFT)
+                                            for (let j = 0; j < freqData.length; j++) {
+                                              const freq = (j / freqData.length) * (sampleRate / 2);
+                                              let magnitude = 0;
+
+                                              // Calculate magnitude for this frequency bin
+                                              for (let k = 0; k < chunk.length; k++) {
+                                                magnitude += Math.abs(chunk[k]);
+                                              }
+
+                                              frequencyProfile[j] += magnitude / chunks;
+                                            }
+                                          }
+
+                                          // Analyze which frequencies need enhancement
+                                          const recommendations = [];
+                                          const nyquist = sampleRate / 2;
+
+                                          FREQUENCY_BANDS.forEach(band => {
+                                            const startBin = Math.floor((band.min / nyquist) * frequencyProfile.length);
+                                            const endBin = Math.floor((band.max / nyquist) * frequencyProfile.length);
+
+                                            let avgMagnitude = 0;
+                                            for (let i = startBin; i <= endBin && i < frequencyProfile.length; i++) {
+                                              avgMagnitude += frequencyProfile[i];
+                                            }
+                                            avgMagnitude /= (endBin - startBin + 1);
+
+                                            // Check if this band needs enhancement based on ISO 226:2003
+                                            const centerFreq = (band.min + band.max) / 2;
+                                            const isoCompensation = EQUAL_LOUDNESS_COMPENSATION[centerFreq] || 0;
+
+                                            if (isoCompensation > 2 || avgMagnitude < 0.1) {
+                                              recommendations.push({
+                                                band: band.name,
+                                                frequencyRange: `${band.min}-${band.max} Hz`,
+                                                enhancementNeeded: true,
+                                                suggestedBoost: Math.min(6, Math.abs(isoCompensation)),
+                                                                   reason: isoCompensation > 2 ? 'Hard to hear frequency range' : 'Low content in this range'
+                                              });
+                                            }
+                                          });
+
+                                          return {
+                                            sampleRate,
+                                            duration: audioBuffer.duration,
+                                            recommendations,
+                                            overallScore: recommendations.length === 0 ? 100 : Math.max(0, 100 - (recommendations.length * 15)),
+                                      message: recommendations.length === 0
+                                      ? 'Audio has good frequency balance'
+  : `${recommendations.length} frequency ranges could benefit from enhancement`
+                                          };
+                                        } catch (error) {
+                                          console.error('Error analyzing audio for hearing:', error);
+                                          return null;
+                                        }
+                                      },
+
+                                      // Test tone generator for hearing tests
+                                      generateTestTone: async (frequency, duration = 1000, volume = 0.1) => {
+                                        try {
+                                          await initializeAudio();
+                                          const ctx = nodeManagerRef.current?.getContext();
+                                          if (!ctx) return;
+
+                                          const oscillator = ctx.createOscillator();
+                                          const gainNode = ctx.createGain();
+
+                                          oscillator.frequency.value = frequency;
+                                          oscillator.type = 'sine';
+
+                                          // Apply fade in/out to avoid clicks
+                                          gainNode.gain.setValueAtTime(0, ctx.currentTime);
+                                          gainNode.gain.linearRampToValueAtTime(volume, ctx.currentTime + 0.01);
+                                          gainNode.gain.linearRampToValueAtTime(volume, ctx.currentTime + duration / 1000 - 0.01);
+                                          gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + duration / 1000);
+
+                                          oscillator.connect(gainNode);
+                                          gainNode.connect(ctx.destination);
+
+                                          oscillator.start();
+                                          oscillator.stop(ctx.currentTime + duration / 1000);
+
                                           return true;
                                         } catch (error) {
-                                          console.error('Force init failed:', error);
+                                          console.error('Error generating test tone:', error);
                                           return false;
                                         }
                                       },
 
-                                      // Manual connection refresh (useful for fixing connection issues)
-                                      refreshConnections: () => {
-                                        if (nodeManagerRef.current && audioRef.current.src) {
-                                          console.log('Refreshing audio connections...');
-                                          nodeManagerRef.current.disconnect();
-                                          nodeManagerRef.current.connect(eqMode);
-                                          return true;
-                                        }
-                                        return false;
-                                      },
+    // Get hearing profile based on current EQ settings
+    getHearingProfile: () => {
+      const { eqMode, eqGains, advancedEqGains, ultraEqEnabled, hearingCompensation } = getState();
+      const currentGains = eqMode === 'advanced' ? advancedEqGains : eqGains;
+      const frequencies = eqMode === 'advanced' ? ADVANCED_FREQUENCIES : STANDARD_FREQUENCIES;
+
+      const profile = {
+        enhancedFrequencies: [],
+        reducedFrequencies: [],
+        hearingAge: 'normal',
+        recommendations: []
+      };
+
+      frequencies.forEach((freq, index) => {
+        const gain = currentGains[index] || 0;
+        const isoCompensation = EQUAL_LOUDNESS_COMPENSATION[freq] || 0;
+
+        if (gain > 2) {
+          profile.enhancedFrequencies.push({
+            frequency: freq,
+            gain: gain,
+            reason: isoCompensation > 2 ? 'Compensating for hearing sensitivity' : 'User preference'
+          });
+        } else if (gain < -2) {
+          profile.reducedFrequencies.push({
+            frequency: freq,
+            gain: gain
+          });
+        }
+      });
+
+      // Estimate hearing age based on high frequency enhancement
+      const highFreqBoost = frequencies
+        .filter(f => f > 8000)
+        .map((f) => currentGains[frequencies.indexOf(f)] || 0)
+        .reduce((sum, g) => sum + g, 0) / frequencies.filter(f => f > 8000).length;
+
+      if (highFreqBoost > 3) {
+        profile.hearingAge = 'mature (50+)';
+        profile.recommendations.push('Consider professional hearing evaluation');
+      } else if (highFreqBoost > 1.5) {
+        profile.hearingAge = 'middle-aged (35-50)';
+      } else {
+        profile.hearingAge = 'young adult (under 35)';
+      }
+
+      if (ultraEqEnabled && hearingCompensation) {
+        profile.recommendations.push('ISO 226:2003 compensation is active');
+      } else if (profile.enhancedFrequencies.some(f => f.frequency > 8000)) {
+        profile.recommendations.push('Consider enabling Ultra EQ for automatic hearing compensation');
+      }
+
+      return profile;
+    },
+
+    // Constants
+    frequencies: {
+      standard: STANDARD_FREQUENCIES,
+      advanced: ADVANCED_FREQUENCIES,
+    },
+    frequencyBands: FREQUENCY_BANDS,
+    presets: EQ_PRESETS,
+    equalLoudnessCompensation: EQUAL_LOUDNESS_COMPENSATION,
+    iso226Curve: ISO_226_2003_80_PHON,
+    realtimeConfig: REALTIME_CONFIG,
+
+    // Zustand store reference for direct access
+    store: useAudioStore,
   }), [
-    eqMode,
-    eqGains,
-    advancedEqGains,
-    targetEqGains,
-    targetAdvancedEqGains,
-    eqSmartEnabled,
-    eqSmartProcessing,
-    eqSmartSuggestions,
-    dynamicEqEnabled,
-    realtimeAnalysisData,
-    currentTrack,
-    isPlaying,
-    duration,
-    currentTime,
-    volume,
-    buffering,
-    loading,
-    error,
-    queue,
-    queueIndex,
-    queueHistory,
-    shuffle,
-    repeat,
-    networkStatus,
-    offlineMode,
-    visualizerData,
+    // Only stable function references - NO state
+    getAudioContext,
+    getAnalyzerNode,
+    setEqModeWithReconnect,
+    toggleEqMode,
     setEqGain,
     setAdvancedEqGain,
     resetEq,
     applyEqPreset,
-    applyEqSmartSettings,
+    toggleEqSmart,
+    setEqSmartSettingsValidated,
+    requestMicrophoneAccess,
+    toggleDynamicEq,
+    toggleUltraEq,
+    toggleHearingCompensation,
     playTrack,
     togglePlay,
     seek,
     setAudioVolume,
     addToQueue,
     removeFromQueue,
+    clearQueue,
     playNext,
     playPrevious,
+    toggleShuffle,
+    toggleRepeat,
+    toggleOfflineMode,
     initializeAudio,
   ]);
 
+  // Simplified provider - only methods context (state via Zustand)
   return (
     <AudioContextData.Provider value={contextValue}>
-    {children}
+      {children}
     </AudioContextData.Provider>
   );
 };
 
-// Export hook
+// ─────────────────────────────────────────────────
+// EXPORTS - Methods from Context, State from Zustand
+// ─────────────────────────────────────────────────
+
+// Context hook for methods (playTrack, togglePlay, etc.)
 export const useAudio = () => {
   const context = useContext(AudioContextData);
   if (!context) {
     throw new Error('useAudio must be used within an AudioProvider');
   }
   return context;
+};
+
+// Re-export Zustand store and selectors for state access
+export {
+  useAudioStore,
+  useCurrentTrack,
+  useIsPlaying,
+  useDuration,
+  useCurrentTime,
+  useVolume,
+  useBuffering,
+  useLoading,
+  usePlaybackError,
+  useQueue,
+  useQueueIndex,
+  useQueueHistory,
+  useShuffle,
+  useRepeat,
+  useEqMode,
+  useEqGains,
+  useAdvancedEqGains,
+  useTargetEqGains,
+  useTargetAdvancedEqGains,
+  useIsDraggingEQ,
+  useEqSmartEnabled,
+  useEqSmartSettings,
+  useEqSmartProcessing,
+  useEqSmartSuggestions,
+  useDynamicEqEnabled,
+  useBassTone,
+  useUltraEqEnabled,
+  useHearingCompensation,
+  useMicStatus,
+  useMicLevel,
+  useAmbientSnapshot,
+  useNetworkStatus,
+  useOfflineMode,
+  usePlaybackState,
+  getAudioStore,
+} from '../stores/audioStore';
+
+// Legacy compatibility hooks (for backward compatibility with existing code)
+export const useNowPlaying = () => {
+  const context = useContext(AudioContextData);
+  if (!context) {
+    throw new Error('useNowPlaying must be used within an AudioProvider');
+  }
+  const { currentTrack, isPlaying, buffering, loading } = useAudioStore.getState();
+  return {
+    currentTrack,
+    isPlaying,
+    buffering,
+    loading,
+    playTrack: context.playTrack,
+    togglePlay: context.togglePlay,
+    addToQueue: context.addToQueue,
+  };
+};
+
+export const usePlayback = () => {
+  return useAudio();
+};
+
+export const useQueueContext = () => {
+  const context = useContext(AudioContextData);
+  if (!context) {
+    throw new Error('useQueueContext must be used within an AudioProvider');
+  }
+  const { queue, queueIndex, queueHistory } = useAudioStore.getState();
+  return {
+    queue,
+    queueIndex,
+    queueHistory,
+    addToQueue: context.addToQueue,
+    removeFromQueue: context.removeFromQueue,
+    clearQueue: context.clearQueue,
+    playNext: context.playNext,
+    playPrevious: context.playPrevious,
+  };
 };
 
 export default AudioProvider;

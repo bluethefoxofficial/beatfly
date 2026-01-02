@@ -1,54 +1,164 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Clock, Heart } from 'lucide-react';
-import { useAudio } from '../contexts/AudioContext';
+import { Play, Pause, Clock, Heart, Music2, Loader2 } from 'lucide-react';
+import { useAudio, useCurrentTrack, useIsPlaying } from '../contexts/AudioContext';
 import MusicAPI from '../services/api';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useResponsive } from '../components/layout/MainLayout';
 
-// Updated MarqueeText Component with fixed width and no fades
-const MarqueeText = ({ text, className = '' }) => {
-  const baseDuration = 20;
-  const duration = Math.max(baseDuration, text.length * 0.4);
+// Helper to build proper image URL from stored path
+const buildImageUrl = (imagePath) => {
+  if (!imagePath || typeof imagePath !== 'string') return null;
+  if (imagePath.startsWith('http')) return imagePath;
+  const filename = imagePath.includes('/')
+    ? imagePath.substring(imagePath.lastIndexOf('/') + 1)
+    : imagePath;
+  return `https://api.beatfly-music.xyz/xrpc/images/albumArt/${filename}`;
+};
+
+const formatDuration = (seconds) => {
+  if (!seconds) return '--:--';
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+};
+
+const formatDate = (dateString) => {
+  if (!dateString) return 'Unknown';
+  const date = new Date(dateString);
+  return date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric'
+  });
+};
+
+// Track Row Component
+const TrackRow = ({ song, index, isMobile }) => {
+  const currentTrack = useCurrentTrack();
+  const isPlaying = useIsPlaying();
+  const { playTrack, togglePlay } = useAudio();
+
+  const isCurrentTrack = currentTrack?.id === song.id;
+  const isCurrentlyPlaying = isCurrentTrack && isPlaying;
+
+  const handlePlay = (e) => {
+    e.stopPropagation();
+    if (isCurrentTrack) {
+      togglePlay();
+    } else {
+      playTrack(song);
+    }
+  };
+
+  const imageUrl = buildImageUrl(song.track_image);
 
   return (
-    <div className={`relative overflow-hidden w-48 ${className}`}>
-      <motion.div
-        className="whitespace-nowrap"
-        animate={{ x: [0, "-100%"] }}
-        transition={{
-          x: {
-            duration: duration,
-            ease: "linear",
-            repeat: Infinity,
-            repeatType: "loop"
-          }
-        }}
-      >
-        {text}
-      </motion.div>
-    </div>
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.03 }}
+      onClick={() => playTrack(song)}
+      className={`group flex items-center gap-3 ${isMobile ? 'p-3' : 'p-4'} rounded-xl
+        bg-white/5 hover:bg-white/10 border border-white/5 hover:border-white/10
+        backdrop-blur-sm cursor-pointer transition-all duration-200
+        ${isCurrentTrack ? 'bg-accent/10 border-accent/20' : ''}`}
+    >
+      {/* Track Number / Play Button */}
+      <div className={`${isMobile ? 'w-6' : 'w-8'} flex-shrink-0 text-center`}>
+        {isCurrentlyPlaying ? (
+          <div className="flex items-center justify-center gap-0.5">
+            <span className="w-1 h-4 bg-accent rounded-full animate-pulse" />
+            <span className="w-1 h-3 bg-accent rounded-full animate-pulse delay-75" />
+            <span className="w-1 h-4 bg-accent rounded-full animate-pulse delay-150" />
+          </div>
+        ) : (
+          <>
+            <span className="text-white/40 text-sm group-hover:hidden">{index + 1}</span>
+            <button onClick={handlePlay} className="hidden group-hover:block">
+              <Play size={16} className="text-white mx-auto" fill="white" />
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Album Art */}
+      <div className={`relative ${isMobile ? 'w-12 h-12' : 'w-14 h-14'} flex-shrink-0 rounded-lg overflow-hidden`}>
+        {imageUrl ? (
+          <img
+            src={imageUrl}
+            alt={song.title}
+            className="w-full h-full object-cover"
+            loading="lazy"
+            onError={(e) => {
+              e.target.onerror = null;
+              e.target.style.display = 'none';
+              e.target.nextElementSibling?.classList.remove('hidden');
+            }}
+          />
+        ) : null}
+        <div className={`${imageUrl ? 'hidden' : ''} absolute inset-0 bg-gradient-to-br from-accent/30 to-purple-600/30 flex items-center justify-center`}>
+          <Music2 size={isMobile ? 16 : 20} className="text-white/60" />
+        </div>
+
+        {/* Play overlay on hover */}
+        <button
+          onClick={handlePlay}
+          className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity"
+        >
+          {isCurrentlyPlaying ? (
+            <Pause size={20} fill="white" className="text-white" />
+          ) : (
+            <Play size={20} fill="white" className="text-white" />
+          )}
+        </button>
+      </div>
+
+      {/* Track Info */}
+      <div className="flex-1 min-w-0">
+        <div className={`font-medium truncate ${isMobile ? 'text-sm' : ''} ${isCurrentTrack ? 'text-accent' : 'text-white'}`}>
+          {song.title}
+        </div>
+        <div className={`text-white/50 truncate ${isMobile ? 'text-xs' : 'text-sm'}`}>
+          {song.artist}
+        </div>
+      </div>
+
+      {/* Album (desktop only) */}
+      {!isMobile && (
+        <div className="hidden md:block w-1/4 truncate text-white/40 text-sm">
+          {song.album || 'Unknown Album'}
+        </div>
+      )}
+
+      {/* Date Added (desktop only) */}
+      {!isMobile && (
+        <div className="hidden lg:block w-32 text-white/40 text-sm">
+          {song.dateAdded}
+        </div>
+      )}
+
+      {/* Duration */}
+      <div className={`text-white/40 ${isMobile ? 'text-xs' : 'text-sm'} flex-shrink-0`}>
+        {song.duration}
+      </div>
+    </motion.div>
   );
 };
 
 const LikedSongs = () => {
-  const { playTrack } = useAudio();
+  const { isMobile } = useResponsive();
+  const { playTrack, setQueue } = useAudio();
   const [likedSongs, setLikedSongs] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [windowWidth, setWindowWidth] = useState(window.innerWidth);
-
-  // Update window width on resize
-  useEffect(() => {
-    const handleResize = () => setWindowWidth(window.innerWidth);
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
-  const isMobile = windowWidth < 640;
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     fetchLikedSongs();
   }, []);
 
   const fetchLikedSongs = async () => {
+    setLoading(true);
+    setError(null);
     try {
       const response = await MusicAPI.getFavoriteTracks();
       if (response.data && response.data.tracks) {
@@ -60,149 +170,174 @@ const LikedSongs = () => {
         }));
         setLikedSongs(formattedTracks);
       }
-    } catch (error) {
-      console.error('Error fetching liked songs:', error);
+    } catch (err) {
+      console.error('Error fetching liked songs:', err);
+      setError('Failed to load liked songs');
     } finally {
       setLoading(false);
     }
   };
 
-  // Format date to "MMM DD, YYYY"
-  const formatDate = (dateString) => {
-    if (!dateString) return 'Unknown';
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric'
-    });
+  const handlePlayAll = () => {
+    if (likedSongs.length > 0) {
+      setQueue(likedSongs);
+      playTrack(likedSongs[0]);
+    }
   };
 
-  // Format duration from seconds to "mm:ss"
-  const formatDuration = (seconds) => {
-    if (!seconds) return '--:--';
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = Math.floor(seconds % 60);
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  const handleShuffle = () => {
+    if (likedSongs.length > 0) {
+      const shuffled = [...likedSongs].sort(() => Math.random() - 0.5);
+      setQueue(shuffled);
+      playTrack(shuffled[0]);
+    }
   };
-
-  if (loading) {
-    return (
-      <motion.div
-        className="min-h-full flex items-center justify-center"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        transition={{ duration: 0.5 }}
-      >
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-accent"></div>
-      </motion.div>
-    );
-  }
 
   return (
-    <motion.div
-      className="min-h-full bg-gradient-to-b from-accent/30 to-background p-4 sm:p-8 overflow-x-hidden"
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.95 }}
-      transition={{ duration: 0.5 }}
-    >
-      {/* Header */}
-      <div className="flex items-end gap-4 mb-6">
-        <div className="w-40 h-40 sm:w-52 sm:h-52 bg-gradient-to-br from-accent to-accent-dark flex items-center justify-center shadow-lg rounded-lg">
-          <Heart size={48} className="text-white" />
-        </div>
-        <div>
-          <h5 className="text-xs sm:text-sm text-white/80">Playlist</h5>
-          <h1 className="text-3xl sm:text-5xl font-bold mb-2">Liked Songs</h1>
-          <p className="text-xs sm:text-sm text-white/60">{likedSongs.length} liked tracks</p>
+    <div className="min-h-screen pb-32">
+      {/* Hero Header with Glass Styling */}
+      <div className="relative overflow-hidden">
+        {/* Gradient Background */}
+        <div className="absolute inset-0 bg-gradient-to-b from-pink-500/30 via-accent/20 to-transparent" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-pink-500/20 via-transparent to-transparent" />
+
+        <div className={`relative z-10 ${isMobile ? 'px-4 pt-6 pb-4' : 'px-6 lg:px-8 pt-8 pb-6'}`}>
+          <div className="max-w-6xl mx-auto">
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={`flex ${isMobile ? 'flex-col gap-4' : 'items-end gap-6'} mb-6`}
+            >
+              {/* Liked Songs Icon - Glass Card */}
+              <div className={`${isMobile ? 'w-32 h-32 mx-auto' : 'w-48 h-48'} glass-hero rounded-2xl bg-gradient-to-br from-pink-500/40 to-purple-600/40 flex items-center justify-center shadow-2xl`}>
+                <Heart size={isMobile ? 48 : 72} className="text-white drop-shadow-lg" fill="white" />
+              </div>
+
+              <div className={`${isMobile ? 'text-center' : ''} flex-1`}>
+                <p className={`text-white/50 ${isMobile ? 'text-xs' : 'text-sm'} font-medium uppercase tracking-wider mb-1`}>
+                  Playlist
+                </p>
+                <h1 className={`${isMobile ? 'text-3xl' : 'text-4xl lg:text-5xl'} font-bold text-white mb-2`}>
+                  Liked Songs
+                </h1>
+                <p className={`text-white/50 ${isMobile ? 'text-sm' : ''}`}>
+                  {likedSongs.length} {likedSongs.length === 1 ? 'song' : 'songs'}
+                </p>
+              </div>
+            </motion.div>
+
+            {/* Action Buttons */}
+            {likedSongs.length > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.1 }}
+                className="flex items-center gap-3"
+              >
+                <button
+                  onClick={handlePlayAll}
+                  className={`flex items-center gap-2 ${isMobile ? 'px-5 py-2.5 text-sm' : 'px-6 py-3'} rounded-full bg-accent hover:bg-accent/90 text-white font-medium transition-all shadow-lg shadow-accent/25`}
+                >
+                  <Play size={isMobile ? 18 : 20} fill="white" />
+                  Play All
+                </button>
+                <button
+                  onClick={handleShuffle}
+                  className={`flex items-center gap-2 ${isMobile ? 'px-5 py-2.5 text-sm' : 'px-6 py-3'} rounded-full bg-white/10 hover:bg-white/20 border border-white/10 text-white font-medium transition-all backdrop-blur-sm`}
+                >
+                  Shuffle
+                </button>
+              </motion.div>
+            )}
+          </div>
         </div>
       </div>
 
-      {likedSongs.length === 0 ? (
-        <div className="text-sm text-gray-400 flex items-center justify-center py-4">
-          No liked songs yet
-        </div>
-      ) : (
-        <>
-          {/* Desktop Grid Header */}
-          {!isMobile && (
-            <div className="grid grid-cols-[auto,3fr,2fr,2fr,auto] gap-4 px-4 py-2 text-sm text-gray-400 border-b border-white/10">
-              <div>#</div>
-              <div>Title</div>
-              <div>Album</div>
-              <div>Date Added</div>
-              <div className="flex justify-end">
-                <Clock size={16} />
+      {/* Content */}
+      <div className={`${isMobile ? 'px-4' : 'px-6 lg:px-8'} mt-6`}>
+        <div className="max-w-6xl mx-auto">
+          {/* Loading State */}
+          {loading && (
+            <div className="flex flex-col items-center justify-center py-16">
+              <div className="relative">
+                <div className="w-16 h-16 rounded-full border-4 border-accent/20 border-t-accent animate-spin" />
+                <Heart size={24} className="absolute inset-0 m-auto text-accent" />
               </div>
+              <p className="mt-4 text-white/50">Loading your liked songs...</p>
             </div>
           )}
 
-          {likedSongs.map((song, index) => (
+          {/* Error State */}
+          {error && !loading && (
             <motion.div
-              key={song.id}
-              onClick={() => playTrack(song)}
-              className={`${
-                isMobile
-                  ? "flex items-center gap-2 p-2 hover:bg-surface-light rounded-md"
-                  : "grid grid-cols-[auto,3fr,2fr,2fr,auto] gap-4 items-center px-4 py-2 hover:bg-surface-light group rounded-md"
-              }`}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: index * 0.05 }}
+              className="glass-card rounded-2xl p-8 text-center"
             >
-              <div className={`${isMobile ? "w-6 text-center" : "text-base text-gray-400 group-hover:text-white"}`}>
-                {index + 1}
+              <div className="w-16 h-16 rounded-full bg-red-500/10 flex items-center justify-center mx-auto mb-4">
+                <Heart size={32} className="text-red-400" />
               </div>
-              <div className="flex items-center gap-2 flex-1">
-                <div className="relative w-10 h-10">
-                  <img
-                    src={MusicAPI.getImage('albumArt', song.track_image + "?w=40")}
-                    alt={song.title}
-                    className="w-full h-full object-cover rounded"
-                    onError={(e) => {
-                      e.target.onerror = null;
-                      e.target.src = '/default-album-art.png';
-                    }}
-                  />
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      playTrack(song);
-                    }}
-                    className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity rounded"
-                  >
-                    <Play size={16} fill="white" />
-                  </button>
-                </div>
-                <div className="flex-1">
-                  {isMobile ? (
-                    <MarqueeText text={song.title} className="font-medium text-sm" />
-                  ) : (
-                    <div className="font-medium truncate group-hover:text-white">
-                      {song.title}
-                    </div>
-                  )}
-                  <div className="text-xs text-gray-400 truncate">{song.artist}</div>
-                </div>
-              </div>
-              {!isMobile && (
-                <>
-                  <div className="truncate text-gray-400 group-hover:text-white">
-                    {song.album}
-                  </div>
-                  <div className="truncate text-gray-400">{song.dateAdded}</div>
-                  <div className="flex justify-end text-gray-400">{song.duration}</div>
-                </>
-              )}
-              {isMobile && (
-                <div className="text-xs text-gray-400">{song.duration}</div>
-              )}
+              <p className="text-red-400 mb-4">{error}</p>
+              <button
+                onClick={fetchLikedSongs}
+                className="px-5 py-2.5 rounded-xl bg-accent text-white font-medium hover:bg-accent/90 transition-all"
+              >
+                Try Again
+              </button>
             </motion.div>
-          ))}
-        </>
-      )}
-    </motion.div>
+          )}
+
+          {/* Empty State */}
+          {!loading && !error && likedSongs.length === 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="glass-card rounded-2xl p-8 text-center"
+            >
+              <div className="w-24 h-24 rounded-full bg-white/5 flex items-center justify-center mx-auto mb-4">
+                <Heart size={40} className="text-white/20" />
+              </div>
+              <h3 className="text-xl font-semibold text-white mb-2">No liked songs yet</h3>
+              <p className="text-white/50 max-w-md mx-auto">
+                Start exploring and tap the heart icon on songs you love to add them here.
+              </p>
+            </motion.div>
+          )}
+
+          {/* Track List */}
+          {!loading && !error && likedSongs.length > 0 && (
+            <div className="glass-card rounded-2xl border border-white/10 overflow-hidden">
+              {/* Header (desktop only) */}
+              {!isMobile && (
+                <div className="hidden md:grid md:grid-cols-[auto,3fr,1fr,auto] lg:grid-cols-[auto,3fr,1fr,8rem,auto] gap-4 px-4 py-3 text-sm text-white/40 border-b border-white/10 bg-white/5">
+                  <div className="w-8 text-center">#</div>
+                  <div>Title</div>
+                  <div className="hidden md:block">Album</div>
+                  <div className="hidden lg:block">Date Added</div>
+                  <div className="flex justify-end pr-2">
+                    <Clock size={16} />
+                  </div>
+                </div>
+              )}
+
+              {/* Tracks */}
+              <div className={`${isMobile ? 'p-2' : 'p-2'} space-y-1`}>
+                <AnimatePresence>
+                  {likedSongs.map((song, index) => (
+                    <TrackRow
+                      key={song.id}
+                      song={song}
+                      index={index}
+                      isMobile={isMobile}
+                    />
+                  ))}
+                </AnimatePresence>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   );
 };
 

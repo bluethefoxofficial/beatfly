@@ -7,6 +7,16 @@ export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  const extractToken = (data) => {
+    if (!data) return null;
+    if (typeof data === 'string') return data;
+    if (typeof data.token === 'string') return data.token;
+    if (typeof data.access_token === 'string') return data.access_token;
+    if (typeof data.jwt === 'string') return data.jwt;
+    if (data.token && typeof data.token.token === 'string') return data.token.token;
+    return null;
+  };
+
   // When the provider mounts, check if there's a valid token and load the user profile.
   useEffect(() => {
     checkAuth();
@@ -32,7 +42,16 @@ export const AuthProvider = ({ children }) => {
     try {
       // Login returns a token
       const response = await MusicAPI.login(email, password);
-      localStorage.setItem('token', response.data.token);
+      const token = extractToken(response.data);
+      if (!token) {
+        return {
+          success: false,
+          error: 'Login response did not include a token',
+        };
+      }
+
+      localStorage.setItem('token', token);
+
       // Immediately fetch the user's profile to set the user state.
       const profileResponse = await MusicAPI.getProfile();
       setUser(profileResponse.data);

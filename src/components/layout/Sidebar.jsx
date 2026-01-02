@@ -7,9 +7,11 @@ import {
   Home, Search, Library, PlusSquare,
   Heart, Clock, Music, ChevronLeft,
   ChevronRight, Plus, Mic, RefreshCcw,
-  Music2, Menu, X, Github, MessageCircle
+  Music2, Menu, X, Github, MessageCircle,
+  Shield, CalendarRange, Settings
 } from 'lucide-react';
 import MusicAPI from '../../services/api';
+import { useAuth } from '../../contexts/AuthContext';
 
 // Desktop NavItem component
 const DesktopNavItem = ({ to, icon: Icon, children, isCollapsed, onClick = null }) => {
@@ -92,7 +94,7 @@ const ExternalLinkItem = ({ href, icon: Icon, children, isCollapsed }) => {
   );
 };
 
-// Mobile NavItem component
+// Mobile NavItem component with liquid glass styling
 const MobileNavItem = ({ to, icon: Icon, children, onClick }) => {
   const location = useLocation();
   const isActive = location.pathname === to;
@@ -100,15 +102,53 @@ const MobileNavItem = ({ to, icon: Icon, children, onClick }) => {
   return (
     <NavLink
       to={to}
-      className={`
-        flex flex-col items-center justify-center p-1
-        transition-all duration-200 text-xs
-        ${isActive ? 'text-accent' : 'text-gray-400'}
-      `}
+      className="relative flex flex-col items-center justify-center py-1.5 px-5 transition-all duration-300"
       onClick={onClick}
     >
-      <Icon size={20} className={isActive ? 'text-accent' : ''} />
-      <span className="mt-1">{children}</span>
+      {/* Active glow effect */}
+      {isActive && (
+        <motion.div
+          layoutId="navGlow"
+          className="absolute inset-0 rounded-2xl"
+          style={{
+            background: 'radial-gradient(ellipse at center, rgba(236,72,153,0.2) 0%, transparent 70%)',
+          }}
+          transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+        />
+      )}
+
+      {/* Icon container with liquid glass effect when active */}
+      <motion.div
+        className="relative p-2.5 rounded-2xl transition-all duration-300"
+        style={{
+          background: isActive
+            ? 'linear-gradient(135deg, rgba(236,72,153,0.25) 0%, rgba(139,92,246,0.15) 100%)'
+            : 'transparent',
+          boxShadow: isActive
+            ? 'inset 0 1px 1px rgba(255,255,255,0.2), 0 2px 8px rgba(236,72,153,0.2)'
+            : 'none'
+        }}
+        whileTap={{ scale: 0.9 }}
+      >
+        <Icon
+          size={22}
+          className="transition-all duration-300"
+          style={{
+            color: isActive ? '#f472b6' : 'rgba(255,255,255,0.5)',
+            filter: isActive ? 'drop-shadow(0 0 8px rgba(236,72,153,0.6))' : 'none'
+          }}
+        />
+      </motion.div>
+
+      <span
+        className="text-[10px] font-medium mt-1 transition-all duration-300"
+        style={{
+          color: isActive ? '#fff' : 'rgba(255,255,255,0.45)',
+          textShadow: isActive ? '0 0 10px rgba(236,72,153,0.5)' : 'none'
+        }}
+      >
+        {children}
+      </span>
     </NavLink>
   );
 };
@@ -221,7 +261,16 @@ const PlaylistSection = ({ isCollapsed, playlists, fetchPlaylists }) => {
 };
 
 // Mobile menu sheet component with swipe gestures
-const MobileMenuSheet = ({ isOpen, onClose, playlists, isArtist, navigate, fetchPlaylists }) => {
+const MobileMenuSheet = ({
+  isOpen,
+  onClose,
+  playlists,
+  isArtist,
+  isAdmin,
+  isYearInReviewSeason,
+  navigate,
+  fetchPlaylists
+}) => {
   const dragControls = useDragControls();
 
   return (
@@ -277,9 +326,21 @@ const MobileMenuSheet = ({ isOpen, onClose, playlists, isArtist, navigate, fetch
                 <MobileMenuItem to="/create-playlist" icon={PlusSquare} onClick={onClose}>Create Playlist</MobileMenuItem>
                 <MobileMenuItem to="/liked-songs" icon={Heart} onClick={onClose}>Liked Songs</MobileMenuItem>
                 <MobileMenuItem to="/recent" icon={Clock} onClick={onClose}>Recently Played</MobileMenuItem>
+                {isYearInReviewSeason && (
+                  <MobileMenuItem to="/year-in-review" icon={CalendarRange} onClick={onClose}>Year in Review</MobileMenuItem>
+                )}
                 {isArtist && (
                   <MobileMenuItem to="/artist/dashboard" icon={Mic} onClick={onClose}>Artist Dashboard</MobileMenuItem>
                 )}
+                {isAdmin && (
+                  <MobileMenuItem to="/admin" icon={Shield} onClick={onClose}>Admin Panel</MobileMenuItem>
+                )}
+                <div className="px-2 py-4">
+                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+                    Account
+                  </span>
+                </div>
+                <MobileMenuItem to="/settings" icon={Settings} onClick={onClose}>Settings</MobileMenuItem>
               </div>
               
               <div className="px-2 py-4">
@@ -388,12 +449,16 @@ const Sidebar = () => {
   const { isCollapsed, setIsCollapsed } = useSidebar();
   // Get responsive state from context
   const { isMobile } = useResponsive();
+  const { user } = useAuth();
   
   // Local state
   const [playlists, setPlaylists] = useState([]);
   const [isArtist, setIsArtist] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   
+  const isAdmin = !!(user?.is_admin || user?.isAdmin || user?.role === 'admin');
+  const isYearInReviewSeason = new Date().getMonth() === 11;
+
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -470,18 +535,71 @@ const Sidebar = () => {
   if (isMobile) {
     return (
       <>
-        {/* Bottom Navigation Bar */}
-        <div className="fixed bottom-0 left-0 right-0 h-16 bg-surface border-t border-white/10 flex items-center justify-around px-2 z-30">
+        {/* Bottom Navigation Bar - Floating Liquid Glass Design */}
+        <div
+          className="fixed bottom-3 left-3 right-3 h-[64px] flex items-center justify-around z-30 rounded-[22px] overflow-hidden"
+          style={{
+            background: `
+              linear-gradient(135deg,
+                rgba(255,255,255,0.12) 0%,
+                rgba(255,255,255,0.05) 40%,
+                rgba(236,72,153,0.08) 70%,
+                rgba(139,92,246,0.06) 100%
+              )
+            `,
+            backdropFilter: 'blur(40px) saturate(200%)',
+            WebkitBackdropFilter: 'blur(40px) saturate(200%)',
+            border: '1px solid rgba(255,255,255,0.15)',
+            boxShadow: `
+              0 8px 32px rgba(0,0,0,0.4),
+              0 2px 8px rgba(236,72,153,0.08),
+              inset 0 1px 1px rgba(255,255,255,0.2),
+              inset 0 -1px 1px rgba(0,0,0,0.1)
+            `
+          }}
+        >
+          {/* Top reflection highlight */}
+          <div
+            className="absolute inset-x-0 top-0 h-8 pointer-events-none rounded-t-[22px]"
+            style={{
+              background: 'linear-gradient(180deg, rgba(255,255,255,0.15) 0%, transparent 100%)'
+            }}
+          />
+
+          {/* Subtle gradient overlay for depth */}
+          <div
+            className="absolute inset-0 pointer-events-none rounded-[22px]"
+            style={{
+              background: 'radial-gradient(ellipse 60% 80% at 50% 100%, rgba(139,92,246,0.08) 0%, transparent 60%)'
+            }}
+          />
+
           <MobileNavItem to="/" icon={Home}>Home</MobileNavItem>
           <MobileNavItem to="/search" icon={Search}>Search</MobileNavItem>
           <MobileNavItem to="/library" icon={Library}>Library</MobileNavItem>
-          <button 
+
+          {/* More button with liquid glass style */}
+          <motion.button
             onClick={() => setShowMenu(true)}
-            className="flex flex-col items-center justify-center p-1 text-gray-400 text-xs"
+            className="relative flex flex-col items-center justify-center py-1.5 px-5"
+            whileTap={{ scale: 0.95 }}
           >
-            <Menu size={20} />
-            <span className="mt-1">More</span>
-          </button>
+            <motion.div
+              className="p-2.5 rounded-2xl transition-all duration-300"
+              whileTap={{ scale: 0.9 }}
+            >
+              <Menu
+                size={22}
+                style={{ color: 'rgba(255,255,255,0.5)' }}
+              />
+            </motion.div>
+            <span
+              className="text-[10px] font-medium mt-1"
+              style={{ color: 'rgba(255,255,255,0.45)' }}
+            >
+              More
+            </span>
+          </motion.button>
         </div>
         
         {/* Mobile Menu Sheet with swipe gestures */}
@@ -490,6 +608,8 @@ const Sidebar = () => {
           onClose={() => setShowMenu(false)}
           playlists={playlists}
           isArtist={isArtist}
+          isAdmin={isAdmin}
+          isYearInReviewSeason={isYearInReviewSeason}
           navigate={navigate}
           fetchPlaylists={fetchPlaylists}
         />
@@ -497,15 +617,28 @@ const Sidebar = () => {
     );
   }
 
-  // Desktop sidebar
+  // Desktop sidebar - Liquid Glass Design
   return (
     <motion.div
       animate={{ width: isCollapsed ? '5rem' : '16rem' }}
       transition={{ duration: 0.3, ease: 'easeInOut' }}
-      className="fixed top-0 left-0 bottom-24 bg-[#121212] flex flex-col
-      overflow-hidden z-30 border-r border-white/5"
+      className="fixed top-0 left-0 bottom-[72px] flex flex-col z-30"
+      style={{
+        background: `
+          linear-gradient(180deg,
+            rgba(255,255,255,0.06) 0%,
+            rgba(255,255,255,0.02) 20%,
+            rgba(6,9,18,0.95) 100%
+          )
+        `,
+        backdropFilter: 'blur(40px) saturate(200%)',
+        WebkitBackdropFilter: 'blur(40px) saturate(200%)',
+        borderRight: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: 'inset -1px 0 0 rgba(255,255,255,0.05)'
+      }}
     >
-      <div className="flex justify-end p-2">
+      {/* Fixed header with collapse button */}
+      <div className="flex-shrink-0 flex justify-end p-2">
         <motion.button
           onClick={() => setIsCollapsed(!isCollapsed)}
           whileHover={{ scale: 1.1 }}
@@ -517,49 +650,68 @@ const Sidebar = () => {
         </motion.button>
       </div>
 
-      <div className="flex flex-col flex-1">
+      {/* Scrollable content area */}
+      <div
+        className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent"
+        style={{
+          maskImage: 'linear-gradient(to bottom, transparent, black 8px, black calc(100% - 8px), transparent)',
+          WebkitMaskImage: 'linear-gradient(to bottom, transparent, black 8px, black calc(100% - 8px), transparent)'
+        }}
+      >
         <div className="space-y-1 py-2">
           <DesktopNavItem to="/" icon={Home} isCollapsed={isCollapsed}>Home</DesktopNavItem>
           <DesktopNavItem to="/search" icon={Search} isCollapsed={isCollapsed}>Search</DesktopNavItem>
           <DesktopNavItem to="/library" icon={Library} isCollapsed={isCollapsed}>Your Library</DesktopNavItem>
         </div>
 
-        <div className="mt-6 space-y-1 py-2">
+        <div className="mt-4 space-y-1 py-2">
           <DesktopNavItem to="/create-playlist" icon={PlusSquare} isCollapsed={isCollapsed}>Create Playlist</DesktopNavItem>
           <DesktopNavItem to="/liked-songs" icon={Heart} isCollapsed={isCollapsed}>Liked Songs</DesktopNavItem>
           <DesktopNavItem to="/recent" icon={Clock} isCollapsed={isCollapsed}>Recently Played</DesktopNavItem>
+          <DesktopNavItem to="/settings" icon={Settings} isCollapsed={isCollapsed}>Settings</DesktopNavItem>
+          {isYearInReviewSeason && (
+            <DesktopNavItem to="/year-in-review" icon={CalendarRange} isCollapsed={isCollapsed}>Year in Review</DesktopNavItem>
+          )}
           {isArtist && (
             <DesktopNavItem to="/artist/dashboard" icon={Mic} isCollapsed={isCollapsed}>Artist Dashboard</DesktopNavItem>
           )}
+          {isAdmin && (
+            <DesktopNavItem to="/admin" icon={Shield} isCollapsed={isCollapsed}>Admin Panel</DesktopNavItem>
+          )}
         </div>
-        
+
         {/* Social Links */}
-        <div className="mt-6 space-y-1 py-2">
-          <ExternalLinkItem 
-            href="https://github.com/Beatfly-music" 
-            icon={Github} 
+        <div className="mt-4 space-y-1 py-2">
+          <ExternalLinkItem
+            href="https://github.com/Beatfly-music"
+            icon={Github}
             isCollapsed={isCollapsed}
           >
             GitHub
           </ExternalLinkItem>
-          <ExternalLinkItem 
-            href="https://discord.gg/Q8ad8X36Ye" 
-            icon={MessageCircle} 
+          <ExternalLinkItem
+            href="https://discord.gg/Q8ad8X36Ye"
+            icon={MessageCircle}
             isCollapsed={isCollapsed}
           >
             Discord Community
           </ExternalLinkItem>
         </div>
 
+        {/* Playlists section */}
         <PlaylistSection
           isCollapsed={isCollapsed}
           playlists={playlists}
           fetchPlaylists={fetchPlaylists}
         />
+
+        {/* Bottom padding for scroll */}
+        <div className="h-4" />
       </div>
 
+      {/* Fixed footer buttons */}
       {!isCollapsed && (
-        <div className="p-4 space-y-4 border-t border-white/5">
+        <div className="flex-shrink-0 p-4 space-y-3 border-t border-white/5">
           <NavLink
             to="/create-playlist"
             className="flex items-center justify-center gap-2 h-10 bg-white/5

@@ -40,6 +40,10 @@ npm run electron:build
 - `src/` - React application source
 - `assets/` - Application resources
 
+## Documentation
+
+- API, admin panel, year-in-review behavior, and playback WebSocket events: `docs/API.md`
+
 ## Technologies
 
 - React 19 + Vite
